@@ -156,6 +156,38 @@ func (s *MetadataStoreSuite) TestCreateNamespaceConcurrent() {
 	}
 }
 
+// A create that fails on a duplicate name rolls back with its metadata bump:
+// the version stays put and the second ID is not stored.
+func (s *MetadataStoreSuite) TestCreateNamespaceDuplicateNameIsAtomic() {
+	name := "test-namespace-dup-" + primitives.NewUUID().String()
+	_, err := s.store.CreateNamespace(s.ctx, &persistence.InternalCreateNamespaceRequest{
+		ID:        primitives.NewUUID().String(),
+		Name:      name,
+		Namespace: &commonpb.DataBlob{Data: []byte("namespace-data"), EncodingType: 1},
+	})
+	s.Require().NoError(err)
+
+	before, err := s.store.GetMetadata(s.ctx)
+	s.Require().NoError(err)
+
+	secondID := primitives.NewUUID().String()
+	_, err = s.store.CreateNamespace(s.ctx, &persistence.InternalCreateNamespaceRequest{
+		ID:        secondID,
+		Name:      name,
+		Namespace: &commonpb.DataBlob{Data: []byte("namespace-data"), EncodingType: 1},
+	})
+	var alreadyExists *serviceerror.NamespaceAlreadyExists
+	s.Require().ErrorAs(err, &alreadyExists)
+
+	after, err := s.store.GetMetadata(s.ctx)
+	s.Require().NoError(err)
+	s.Require().Equal(before.NotificationVersion, after.NotificationVersion)
+
+	_, err = s.store.GetNamespace(s.ctx, &persistence.GetNamespaceRequest{ID: secondID})
+	var notFound *serviceerror.NamespaceNotFound
+	s.Require().ErrorAs(err, &notFound)
+}
+
 func (s *MetadataStoreSuite) TestUpdateNamespace() {
 	id := primitives.NewUUID().String()
 	name := "update-namespace"
