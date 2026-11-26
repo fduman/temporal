@@ -24,21 +24,21 @@ func newTransactionalStore(mongoClient client.Client, handlers ...metrics.Handle
 func (s *transactionalStore) executeTransaction(ctx context.Context, fn func(context.Context) (interface{}, error)) (interface{}, error) {
 	sess, err := s.client.StartSession(ctx)
 	if err != nil {
-		metrics.PersistenceMongoTransactionsFailed.With(s.metricsHandler).Record(1)
-		metrics.PersistenceMongoSessionsInProgress.With(s.metricsHandler).Record(float64(s.client.NumberSessionsInProgress()))
+		persistenceMongoTransactionsFailed.With(s.metricsHandler).Record(1)
+		persistenceMongoSessionsInProgress.With(s.metricsHandler).Record(float64(s.client.NumberSessionsInProgress()))
 		return nil, serviceerror.NewUnavailablef("failed to start mongo session: %v", err)
 	}
-	metrics.PersistenceMongoSessionsInProgress.With(s.metricsHandler).Record(float64(s.client.NumberSessionsInProgress()))
+	persistenceMongoSessionsInProgress.With(s.metricsHandler).Record(float64(s.client.NumberSessionsInProgress()))
 	defer func() {
 		sess.EndSession(ctx)
-		metrics.PersistenceMongoSessionsInProgress.With(s.metricsHandler).Record(float64(s.client.NumberSessionsInProgress()))
+		persistenceMongoSessionsInProgress.With(s.metricsHandler).Record(float64(s.client.NumberSessionsInProgress()))
 	}()
 
-	metrics.PersistenceMongoTransactionsStarted.With(s.metricsHandler).Record(1)
+	persistenceMongoTransactionsStarted.With(s.metricsHandler).Record(1)
 
 	result, err := sess.WithTransaction(ctx, fn)
 	if err != nil {
-		metrics.PersistenceMongoTransactionsFailed.With(s.metricsHandler).Record(1)
+		persistenceMongoTransactionsFailed.With(s.metricsHandler).Record(1)
 		return nil, err
 	}
 	return result, nil
