@@ -416,3 +416,13 @@ to a new upstream tag. Replace `{PLACEHOLDER}` values.
 | 2026-01-19 | v1.30.0-148.3 | mongo/v1.30.0-148.3-dev | v1.30.0-148.3-mongo.1 | Second rebase; established naming conventions         |
 | 2026-03-01 | v1.30.0-148.6 | mongo/v1.30.0-148.6-dev | v1.30.0-148.6-mongo.2 | Third rebase; zero conflicts (small delta from 148.3) |
 | TBD        | v1.31.0-151.5 | mongo/v1.31.0-151.5-dev | —                     | Cross-minor bump (v1.30 → v1.31); deferred            |
+| 2026-11-26 | v1.32.2       | mongo/v1.32.2-dev       | —                     | First stable-release base (not a nightly); 151.5-dev plugin + 148.6 fixes ported. See notes below |
+
+Notes for the v1.32.2 rebase:
+
+- Based on the stable tag `v1.32.2`, which is on a release branch: `v1.31.0-151.5` is not its ancestor, so compare with `git diff v1.31.0-151.5 v1.32.2`.
+- `run-tests.yml` keeps the fork's own (MongoDB-only) workflow instead of the upstream rewrite.
+- `testcore.UseSQLVisibility()` returns true for `mongodb`: MongoDB takes the non-Elasticsearch test paths, which made the fork's test patches unnecessary.
+- `query/converter.go` is no longer patched: CHASM business-ID aliases (`ActivityId`, ...) resolve through `chasm.WithBusinessIDAlias`.
+- v1.32 API changes handled in the plugin: `CreateTasks` `UpdateMetadata` (TaskQueueInfo can be nil), `CompleteTasksLessThan` `ConditionRangeID`, `visibilityservice` CHASM list/count requests, `NewQueryConverter` metrics/logger, `sadefs.EncodeValue/DecodeValue`, `NewMapperProvider` fallback index, `FirstExecutionRunID`.
+- The current_executions `archetype_id` unique index is built by migration `primary-indexes-002`; workflow rows do not store `archetype_id`.
