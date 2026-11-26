@@ -181,8 +181,8 @@ func (f *Factory) initialize() error {
 	}
 
 	f.transactionsEnabled = true
-	metrics.PersistenceMongoMaxPoolSize.With(f.metricsHandler).Record(float64(f.cfg.MaxConns))
-	metrics.PersistenceMongoSessionsInProgress.With(f.metricsHandler).Record(float64(f.client.NumberSessionsInProgress()))
+	persistenceMongoMaxPoolSize.With(f.metricsHandler).Record(float64(f.cfg.MaxConns))
+	persistenceMongoSessionsInProgress.With(f.metricsHandler).Record(float64(f.client.NumberSessionsInProgress()))
 
 	f.logger.Info("MongoDB connection established",
 		tag.NewStringTag("topology", f.topologyInfo.Type.String()),

@@ -30,17 +30,17 @@ func newTransactionalStore(mongoClient client.Client, handlers ...metrics.Handle
 func (s *transactionalStore) executeTransaction(ctx context.Context, fn func(context.Context) (interface{}, error)) (interface{}, error) {
 	sess, err := s.client.StartSession(ctx)
 	if err != nil {
-		metrics.PersistenceMongoTransactionsFailed.With(s.metricsHandler).Record(1)
-		metrics.PersistenceMongoSessionsInProgress.With(s.metricsHandler).Record(float64(s.client.NumberSessionsInProgress()))
+		persistenceMongoTransactionsFailed.With(s.metricsHandler).Record(1)
+		persistenceMongoSessionsInProgress.With(s.metricsHandler).Record(float64(s.client.NumberSessionsInProgress()))
 		return nil, serviceerror.NewUnavailablef("failed to start mongo session: %v", err)
 	}
-	metrics.PersistenceMongoSessionsInProgress.With(s.metricsHandler).Record(float64(s.client.NumberSessionsInProgress()))
+	persistenceMongoSessionsInProgress.With(s.metricsHandler).Record(float64(s.client.NumberSessionsInProgress()))
 	defer func() {
 		sess.EndSession(ctx)
-		metrics.PersistenceMongoSessionsInProgress.With(s.metricsHandler).Record(float64(s.client.NumberSessionsInProgress()))
+		persistenceMongoSessionsInProgress.With(s.metricsHandler).Record(float64(s.client.NumberSessionsInProgress()))
 	}()
 
-	metrics.PersistenceMongoTransactionsStarted.With(s.metricsHandler).Record(1)
+	persistenceMongoTransactionsStarted.With(s.metricsHandler).Record(1)
 
 	// The driver re-runs the callback immediately, without a limit other than
 	// its own timeout, whenever the callback returns an error labelled
@@ -70,7 +70,7 @@ func (s *transactionalStore) executeTransaction(ctx context.Context, fn func(con
 		return res, err
 	})
 	if err != nil {
-		metrics.PersistenceMongoTransactionsFailed.With(s.metricsHandler).Record(1)
+		persistenceMongoTransactionsFailed.With(s.metricsHandler).Record(1)
 		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
 			// The caller's own deadline or cancellation: report it as such.
 			return nil, err
