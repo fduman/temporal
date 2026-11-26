@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -13,22 +12,13 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
-	"go.temporal.io/server/common/log/tag"
+	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/mongodb/client"
 	"go.temporal.io/server/common/primitives"
 )
 
-// errNamespaceMetadataVersionConflict: the metadata version changed since it
-// was read, another namespace create or update won the race.
-var errNamespaceMetadataVersionConflict = serviceerror.NewUnavailable("namespace metadata version conflict")
-
 const (
-	// A create retries its metadata bump this many times when other creates or
-	// updates bump the version first, waiting up to the jitter in between.
-	maxCreateNamespaceAttempts = 100
-	createNamespaceRetryJitter = 5 * time.Millisecond
-
 	collectionNamespaces        = "namespaces"
 	collectionNamespaceMetadata = "namespace_metadata"
 
@@ -37,6 +27,7 @@ const (
 
 type (
 	metadataStore struct {
+		transactionalStore
 		db                  client.Database
 		cfg                 config.MongoDB
 		logger              log.Logger
@@ -62,11 +53,21 @@ type (
 // NewMetadataStore returns a MongoDB-backed implementation of persistence.MetadataStore.
 func NewMetadataStore(
 	db client.Database,
+	mongoClient client.Client,
 	cfg config.MongoDB,
 	logger log.Logger,
+	metricsHandler metrics.Handler,
 	transactionsEnabled bool,
 ) (persistence.MetadataStore, error) {
+	if !transactionsEnabled {
+		return nil, errors.New("mongodb metadata store requires transactions-enabled topology")
+	}
+	if mongoClient == nil {
+		return nil, errors.New("mongodb metadata store requires client with session support")
+	}
+
 	store := &metadataStore{
+		transactionalStore:  newTransactionalStore(mongoClient, metricsHandler),
 		db:                  db,
 		cfg:                 cfg,
 		logger:              logger,
@@ -109,81 +110,49 @@ func (m *metadataStore) ensureIndexes(ctx context.Context) error {
 	return nil
 }
 
+// CreateNamespace inserts the namespace and advances the metadata version in
+// one transaction, like SQL does under the metadata row lock: the namespace
+// carries the version that precedes the bump. The metadata document is written
+// first, so concurrent creates and updates conflict on it and the driver
+// retries the losing transaction instead of failing the request.
 func (m *metadataStore) CreateNamespace(
 	ctx context.Context,
 	request *persistence.InternalCreateNamespaceRequest,
 ) (*persistence.CreateNamespaceResponse, error) {
-	metadata, err := m.getOrCreateMetadata(ctx)
-	if err != nil {
+	// Create the metadata document outside the transaction: a duplicate key
+	// inside it would abort the transaction.
+	if _, err := m.getOrCreateMetadata(ctx); err != nil {
 		return nil, err
 	}
 
-	collection := m.db.Collection(collectionNamespaces)
+	_, err := m.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
+		version, err := m.incrementMetadata(sessCtx)
+		if err != nil {
+			return nil, err
+		}
 
-	doc := namespaceDocument{
-		ID:                  request.ID,
-		Name:                request.Name,
-		Data:                request.Namespace.Data,
-		DataEncoding:        request.Namespace.EncodingType.String(),
-		IsGlobal:            request.IsGlobal,
-		NotificationVersion: metadata.NotificationVersion,
-		UpdatedAt:           time.Now().UTC(),
-	}
-
-	_, err = collection.InsertOne(ctx, doc)
+		doc := namespaceDocument{
+			ID:                  request.ID,
+			Name:                request.Name,
+			Data:                request.Namespace.Data,
+			DataEncoding:        request.Namespace.EncodingType.String(),
+			IsGlobal:            request.IsGlobal,
+			NotificationVersion: version,
+			UpdatedAt:           time.Now().UTC(),
+		}
+		if _, err := m.db.Collection(collectionNamespaces).InsertOne(sessCtx, doc); err != nil {
+			if mongo.IsDuplicateKeyError(err) {
+				return nil, serviceerror.NewNamespaceAlreadyExists(fmt.Sprintf("namespace %s already exists", request.Name))
+			}
+			return nil, err
+		}
+		return nil, nil
+	})
 	if err != nil {
-		if mongo.IsDuplicateKeyError(err) {
-			return nil, serviceerror.NewNamespaceAlreadyExists(fmt.Sprintf("namespace %s already exists", request.Name))
-		}
-		return nil, serviceerror.NewUnavailablef("CreateNamespace failed: %v", err)
-	}
-
-	if err := m.bumpMetadataForNewNamespace(ctx, request.ID, metadata.NotificationVersion); err != nil {
-		// best-effort cleanup to avoid orphaned namespace
-		if _, deleteErr := collection.DeleteOne(ctx, bson.M{"_id": request.ID}); deleteErr != nil {
-			m.logger.Warn("CreateNamespace cleanup failed", tag.Error(deleteErr), tag.NewStringTag("namespace-id", request.ID))
-		}
-		return nil, err
+		return nil, namespaceWriteError("CreateNamespace", err)
 	}
 
 	return &persistence.CreateNamespaceResponse{ID: request.ID}, nil
-}
-
-// bumpMetadataForNewNamespace advances the namespace metadata version past the
-// version stored on a namespace that CreateNamespace has just inserted.
-//
-// Concurrent creates serialize on the metadata document: SQL does that with a
-// row lock (lockMetadata) and never fails a create because another one ran at
-// the same time. Here, when another create or update bumped the version first,
-// the new namespace takes the current version and the bump is tried again, so
-// that, as in SQL, the namespace carries the version that precedes the bump.
-func (m *metadataStore) bumpMetadataForNewNamespace(ctx context.Context, namespaceID string, version int64) error {
-	collection := m.db.Collection(collectionNamespaces)
-	for attempt := 1; ; attempt++ {
-		err := m.bumpMetadata(ctx, version)
-		if !errors.Is(err, errNamespaceMetadataVersionConflict) {
-			return err
-		}
-		if attempt >= maxCreateNamespaceAttempts {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return err
-		case <-time.After(time.Duration(rand.Int63n(int64(createNamespaceRetryJitter)))):
-		}
-		metadata, err := m.getOrCreateMetadata(ctx)
-		if err != nil {
-			return err
-		}
-		version = metadata.NotificationVersion
-		if _, err := collection.UpdateOne(ctx,
-			bson.M{"_id": namespaceID},
-			bson.M{"$set": bson.M{"notification_version": version}},
-		); err != nil {
-			return serviceerror.NewUnavailablef("CreateNamespace failed: %v", err)
-		}
-	}
 }
 
 func (m *metadataStore) GetNamespace(
@@ -253,17 +222,14 @@ func (m *metadataStore) updateNamespace(
 		return serviceerror.NewInvalidArgument("updateNamespace request is nil")
 	}
 
-	metadata, err := m.getOrCreateMetadata(ctx)
-	if err != nil {
+	if _, err := m.getOrCreateMetadata(ctx); err != nil {
 		return err
 	}
 
-	if metadata.NotificationVersion != request.NotificationVersion {
-		return serviceerror.NewUnavailablef("UpdateNamespace version mismatch: expected %d got %d", metadata.NotificationVersion, request.NotificationVersion)
+	filter := bson.M{"_id": request.Id}
+	if currentName != "" {
+		filter["name"] = currentName
 	}
-
-	collection := m.db.Collection(collectionNamespaces)
-
 	update := bson.M{
 		"$set": bson.M{
 			"name":                 request.Name,
@@ -275,27 +241,39 @@ func (m *metadataStore) updateNamespace(
 		},
 	}
 
-	filter := bson.M{"_id": request.Id}
-	if currentName != "" {
-		filter["name"] = currentName
-	}
+	// The metadata version check and bump come first, as in SQL, and the
+	// namespace write commits only together with it.
+	_, err := m.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
+		result, err := m.db.Collection(collectionNamespaceMetadata).UpdateOne(sessCtx,
+			bson.M{"_id": namespaceMetadataDocumentID, "notification_version": request.NotificationVersion},
+			bson.M{"$inc": bson.M{"notification_version": int64(1)}},
+		)
+		if err != nil {
+			return nil, err
+		}
+		if result.MatchedCount == 0 {
+			return nil, serviceerror.NewUnavailablef("UpdateNamespace version mismatch: expected %d", request.NotificationVersion)
+		}
 
-	result, err := collection.UpdateOne(ctx, filter, update)
+		result, err = m.db.Collection(collectionNamespaces).UpdateOne(sessCtx, filter, update)
+		if err != nil {
+			if mapped := mapDuplicateNamespaceError(err, request.Name); mapped != nil {
+				return nil, mapped
+			}
+			if mongo.IsDuplicateKeyError(err) {
+				return nil, serviceerror.NewNamespaceAlreadyExists(fmt.Sprintf("namespace %s already exists", request.Name))
+			}
+			return nil, err
+		}
+		if result.MatchedCount == 0 {
+			return nil, serviceerror.NewUnavailable("UpdateNamespace operation encountered concurrent write")
+		}
+		return nil, nil
+	})
 	if err != nil {
-		if mapped := mapDuplicateNamespaceError(err, request.Name); mapped != nil {
-			return mapped
-		}
-		if mongo.IsDuplicateKeyError(err) {
-			return serviceerror.NewNamespaceAlreadyExists(fmt.Sprintf("namespace %s already exists", request.Name))
-		}
-		return serviceerror.NewUnavailablef("UpdateNamespace failed: %v", err)
+		return namespaceWriteError("UpdateNamespace", err)
 	}
-
-	if result.MatchedCount == 0 {
-		return serviceerror.NewUnavailable("UpdateNamespace operation encountered concurrent write")
-	}
-
-	return m.bumpMetadata(ctx, metadata.NotificationVersion)
+	return nil
 }
 
 func (m *metadataStore) DeleteNamespace(
@@ -410,17 +388,37 @@ func (m *metadataStore) getOrCreateMetadata(ctx context.Context) (*namespaceMeta
 	return &doc, nil
 }
 
-func (m *metadataStore) bumpMetadata(ctx context.Context, current int64) error {
+// incrementMetadata advances the metadata version inside a transaction and
+// returns the version before the bump. $inc is a real write, so two
+// transactions that both call it conflict and one of them is retried.
+func (m *metadataStore) incrementMetadata(sessCtx context.Context) (int64, error) {
 	collection := m.db.Collection(collectionNamespaceMetadata)
-	update := bson.M{"$set": bson.M{"notification_version": current + 1}}
-	result, err := collection.UpdateOne(ctx, bson.M{"_id": namespaceMetadataDocumentID, "notification_version": current}, update)
+	filter := bson.M{"_id": namespaceMetadataDocumentID}
+	result, err := collection.UpdateOne(sessCtx, filter, bson.M{"$inc": bson.M{"notification_version": int64(1)}})
 	if err != nil {
-		return serviceerror.NewUnavailablef("failed to update namespace metadata: %v", err)
+		return 0, err
 	}
 	if result.MatchedCount == 0 {
-		return errNamespaceMetadataVersionConflict
+		return 0, serviceerror.NewUnavailable("namespace metadata document is missing")
 	}
-	return nil
+	// The transaction reads its own write.
+	var after namespaceMetadataDocument
+	if err := collection.FindOne(sessCtx, filter).Decode(&after); err != nil {
+		return 0, err
+	}
+	return after.NotificationVersion - 1, nil
+}
+
+// namespaceWriteError keeps service errors from a namespace transaction (the
+// ones its body raises, and the ones executeTransaction reports) and reports
+// any other driver error as Unavailable. Driver errors are returned unwrapped
+// from the transaction body so that the driver can still see their retry
+// labels.
+func namespaceWriteError(operation string, err error) error {
+	if isServiceError(err) {
+		return err
+	}
+	return serviceerror.NewUnavailablef("%s failed: %v", operation, err)
 }
 
 // bestEffortUUIDBytes converts a string UUID to []byte for pagination tokens. If parsing fails, returns raw bytes.
