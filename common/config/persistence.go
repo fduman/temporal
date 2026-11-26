@@ -114,9 +114,7 @@ func (c *Persistence) IsSQLVisibilityStore() bool {
 
 func (c *Persistence) IsCustomVisibilityStore() bool {
 	return c.GetVisibilityStoreConfig().CustomDataStoreConfig != nil ||
-		c.GetVisibilityStoreConfig().MongoDB != nil ||
-		c.GetSecondaryVisibilityStoreConfig().CustomDataStoreConfig != nil ||
-		c.GetSecondaryVisibilityStoreConfig().MongoDB != nil
+		c.GetSecondaryVisibilityStoreConfig().CustomDataStoreConfig != nil
 }
 
 func (c *Persistence) GetVisibilityStoreConfig() DataStore {
