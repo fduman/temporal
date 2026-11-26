@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -18,7 +19,16 @@ import (
 	"go.temporal.io/server/common/primitives"
 )
 
+// errNamespaceMetadataVersionConflict: the metadata version changed since it
+// was read, another namespace create or update won the race.
+var errNamespaceMetadataVersionConflict = serviceerror.NewUnavailable("namespace metadata version conflict")
+
 const (
+	// A create retries its metadata bump this many times when other creates or
+	// updates bump the version first, waiting up to the jitter in between.
+	maxCreateNamespaceAttempts = 100
+	createNamespaceRetryJitter = 5 * time.Millisecond
+
 	collectionNamespaces        = "namespaces"
 	collectionNamespaceMetadata = "namespace_metadata"
 
@@ -128,7 +138,7 @@ func (m *metadataStore) CreateNamespace(
 		return nil, serviceerror.NewUnavailablef("CreateNamespace failed: %v", err)
 	}
 
-	if err := m.bumpMetadata(ctx, metadata.NotificationVersion); err != nil {
+	if err := m.bumpMetadataForNewNamespace(ctx, request.ID, metadata.NotificationVersion); err != nil {
 		// best-effort cleanup to avoid orphaned namespace
 		if _, deleteErr := collection.DeleteOne(ctx, bson.M{"_id": request.ID}); deleteErr != nil {
 			m.logger.Warn("CreateNamespace cleanup failed", tag.Error(deleteErr), tag.NewStringTag("namespace-id", request.ID))
@@ -137,6 +147,43 @@ func (m *metadataStore) CreateNamespace(
 	}
 
 	return &persistence.CreateNamespaceResponse{ID: request.ID}, nil
+}
+
+// bumpMetadataForNewNamespace advances the namespace metadata version past the
+// version stored on a namespace that CreateNamespace has just inserted.
+//
+// Concurrent creates serialize on the metadata document: SQL does that with a
+// row lock (lockMetadata) and never fails a create because another one ran at
+// the same time. Here, when another create or update bumped the version first,
+// the new namespace takes the current version and the bump is tried again, so
+// that, as in SQL, the namespace carries the version that precedes the bump.
+func (m *metadataStore) bumpMetadataForNewNamespace(ctx context.Context, namespaceID string, version int64) error {
+	collection := m.db.Collection(collectionNamespaces)
+	for attempt := 1; ; attempt++ {
+		err := m.bumpMetadata(ctx, version)
+		if !errors.Is(err, errNamespaceMetadataVersionConflict) {
+			return err
+		}
+		if attempt >= maxCreateNamespaceAttempts {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(rand.Int63n(int64(createNamespaceRetryJitter)))):
+		}
+		metadata, err := m.getOrCreateMetadata(ctx)
+		if err != nil {
+			return err
+		}
+		version = metadata.NotificationVersion
+		if _, err := collection.UpdateOne(ctx,
+			bson.M{"_id": namespaceID},
+			bson.M{"$set": bson.M{"notification_version": version}},
+		); err != nil {
+			return serviceerror.NewUnavailablef("CreateNamespace failed: %v", err)
+		}
+	}
 }
 
 func (m *metadataStore) GetNamespace(
@@ -371,7 +418,7 @@ func (m *metadataStore) bumpMetadata(ctx context.Context, current int64) error {
 		return serviceerror.NewUnavailablef("failed to update namespace metadata: %v", err)
 	}
 	if result.MatchedCount == 0 {
-		return serviceerror.NewUnavailable("namespace metadata version conflict")
+		return errNamespaceMetadataVersionConflict
 	}
 	return nil
 }
