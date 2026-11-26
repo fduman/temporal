@@ -281,7 +281,7 @@ func (s *visibilityStore) RecordWorkflowExecutionClosed(ctx context.Context, req
 	if err != nil {
 		return err
 	}
-	shouldUnsetTransient := removedTransient || enumspb.WorkflowExecutionStatus(doc.Status) != enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING
+	shouldUnsetTransient := removedTransient || !isOpenExecutionStatus(enumspb.WorkflowExecutionStatus(doc.Status))
 
 	closeTime := request.CloseTime.UTC()
 	doc.CloseTime = &closeTime
@@ -614,7 +614,10 @@ func (s *visibilityStore) ListChasmExecutions(ctx context.Context, request *visi
 		return nil, err
 	}
 
-	return buildListResponse(docs, pageSize, saTypeMap)
+	// CHASM search attributes are not in the namespace type map; without them a
+	// stored payload that lacks type metadata could not be decoded (SQL does the
+	// same in encodeRowSearchAttributes).
+	return buildListResponse(docs, pageSize, store.CombineTypeMaps(saTypeMap, mapper))
 }
 
 func (s *visibilityStore) CountChasmExecutions(ctx context.Context, request *visibilityservice.CountChasmExecutionsRequest) (*store.InternalCountExecutionsResponse, error) {
@@ -660,10 +663,9 @@ func (s *visibilityStore) validateCountChasmRequest(request *visibilityservice.C
 func (s *visibilityStore) buildChasmFilter(ctx context.Context, request *visibilityservice.CountChasmExecutionsRequest, mapper *chasm.VisibilitySearchAttributesMapper) (bson.M, *query.QueryParams[bson.M], error) {
 	filter := mongoAnd(bson.M{"namespace_id": request.NamespaceId})
 
-	if request.Query == "" {
-		return filter, nil, nil
-	}
-
+	// An empty query is converted as well: the converter adds the namespace
+	// division (archetype) filter, without which every execution of the
+	// namespace would be counted.
 	params, err := s.convertQueryParams(ctx, namespace.ID(request.NamespaceId), namespace.Name(request.Namespace), request.Query, mapper, request.ArchetypeId)
 	if err != nil {
 		var converterErr *query.ConverterError
@@ -998,6 +1000,12 @@ func (s *visibilityStore) convertQueryParams(
 }
 
 func encodeGroupValuePayload(col *query.SAColumn, raw any) (*commonpb.Payload, error) {
+	// Documents without the field form a group of their own. For keywords it
+	// is reported as "", like Elasticsearch does (terms aggregation with
+	// Missing("")); e.g. GROUP BY TemporalNamespaceDivision for workflows.
+	if raw == nil && col.ValueType == enumspb.INDEXED_VALUE_TYPE_KEYWORD {
+		raw = ""
+	}
 	var value any
 	switch col.FieldName {
 	case sadefs.ExecutionStatus:
@@ -1180,12 +1188,20 @@ func (s *visibilityStore) renderSearchAttributes(ctx context.Context, sa *common
 	return result, nil
 }
 
+// isOpenExecutionStatus reports whether an execution with this status is still
+// open. A paused workflow is open, as the visibility manager treats it (it gets
+// no close time), so its pause info must stay queryable.
+func isOpenExecutionStatus(status enumspb.WorkflowExecutionStatus) bool {
+	return status == enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING ||
+		status == enumspb.WORKFLOW_EXECUTION_STATUS_PAUSED
+}
+
 func (s *visibilityStore) stripTransientSearchAttributes(doc *visibilityExecutionDocument) (bool, error) {
 	if doc == nil {
 		return false, serviceerror.NewInternal("visibility document is nil")
 	}
 
-	if enumspb.WorkflowExecutionStatus(doc.Status) == enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING {
+	if isOpenExecutionStatus(enumspb.WorkflowExecutionStatus(doc.Status)) {
 		return false, nil
 	}
 
