@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -180,7 +181,7 @@ type (
 		NamespaceID      string     `bson:"namespace_id"`
 		WorkflowID       string     `bson:"workflow_id"`
 		RunID            string     `bson:"run_id"`
-		ArchetypeID      uint32     `bson:"archetype_id"`
+		ArchetypeID      uint32     `bson:"archetype_id,omitempty"`
 		CreateRequestID  string     `bson:"create_request_id,omitempty"`
 		State            int32      `bson:"state"`
 		Status           int32      `bson:"status"`
@@ -270,6 +271,26 @@ func (s *executionStore) ensureIndexes(ctx context.Context) error {
 
 func executionDocID(namespaceID, workflowID, runID string) string {
 	return fmt.Sprintf("%s|%s|%s", namespaceID, workflowID, runID)
+}
+
+// storedArchetypeID is the archetype_id value of a current execution document:
+// zero (left out) for workflows, the archetype for other CHASM executions.
+// Workflow rows thereby look like rows written before archetypes existed, the
+// way SQL keeps workflows in current_executions without an archetype column.
+func storedArchetypeID(archetypeID chasm.ArchetypeID) uint32 {
+	if archetypeID == chasm.UnspecifiedArchetypeID || archetypeID == chasm.WorkflowArchetypeID {
+		return 0
+	}
+	return archetypeID
+}
+
+// archetype returns the archetype of the current execution; a document without
+// archetype_id is a workflow.
+func (d *currentExecutionDocument) archetype() chasm.ArchetypeID {
+	if d.ArchetypeID == 0 {
+		return chasm.WorkflowArchetypeID
+	}
+	return d.ArchetypeID
 }
 
 func currentExecutionDocID(namespaceID, workflowID string, archetypeID chasm.ArchetypeID) string {
@@ -898,6 +919,14 @@ func decodeHistoryNodePageToken(data []byte) (historyNodePageToken, error) {
 	return token, nil
 }
 
+// historyNodeFilter builds the filter of ReadHistoryBranch.
+//
+// The node range is expressed twice, on _id and on node_id. The _id of a
+// history node is "tree|branch|node|txn" with sortable numbers, so a range of
+// node IDs is a range of _id values and is served by the _id index. The same
+// range on node_id lets the {shard_id, tree_id, branch_id, node_id, txn_id}
+// index bound its scan. With both in the filter the read is bounded whichever
+// index the planner picks, including while that index does not exist yet.
 func historyNodeFilter(
 	shardID int32,
 	treeID, branchID string,
@@ -910,53 +939,62 @@ func historyNodeFilter(
 		"branch_id": branchID,
 	}
 
-	if req.ReverseOrder {
-		idCond := bson.M{}
-		if token.LastNodeID != 0 {
+	nodeCond := bson.M{}
+	idCond := bson.M{}
+	if req.MinNodeID != 0 {
+		nodeCond["$gte"] = req.MinNodeID
+		idCond["$gte"] = historyNodeDocID(treeID, branchID, req.MinNodeID, math.MinInt64)
+	}
+	if req.MaxNodeID != 0 {
+		nodeCond["$lt"] = req.MaxNodeID
+		idCond["$lt"] = historyNodeDocID(treeID, branchID, req.MaxNodeID, math.MinInt64)
+	}
+
+	if token.LastNodeID != 0 {
+		if req.ReverseOrder {
+			// Reverse order is node ID descending, then transaction ID
+			// descending, which is _id descending: continue below the last
+			// document returned.
+			delete(nodeCond, "$lt")
+			nodeCond["$lte"] = token.LastNodeID
 			idCond["$lt"] = historyNodeDocID(treeID, branchID, token.LastNodeID, token.LastTxnID)
-		} else if req.MaxNodeID != 0 {
-			idCond["$lt"] = historyNodeDocID(treeID, branchID, req.MaxNodeID, 0)
-		}
-		if req.MinNodeID != 0 {
-			idCond["$gte"] = historyNodeDocID(treeID, branchID, req.MinNodeID, 0)
-		}
-		if len(idCond) > 0 {
-			filter["_id"] = idCond
-		}
-	} else {
-		// Forward order: NodeID ASC, TxnID DESC
-		// SQL uses: ((node_id = ? AND txn_id > ?) OR node_id > ?) AND node_id < ?
-		// Since MongoDB stores TxnID normally (not negated like SQL), we use TxnID < for same NodeID.
-		if token.LastNodeID != 0 {
-			// Pagination with token: get records after the last one
-			// Use $and to combine $or pagination with MaxNodeID constraint
-			orCond := []bson.M{
+		} else {
+			// Forward order is node ID ascending, then transaction ID
+			// descending (SQL stores the negated transaction ID for this):
+			// continue with lower transaction IDs of the last node, then with
+			// higher nodes.
+			nodeCond["$gte"] = token.LastNodeID
+			idCond["$gte"] = historyNodeDocID(treeID, branchID, token.LastNodeID, math.MinInt64)
+			filter["$or"] = []bson.M{
 				{"node_id": bson.M{"$gt": token.LastNodeID}},
 				{"node_id": token.LastNodeID, "txn_id": bson.M{"$lt": token.LastTxnID}},
 			}
-			if req.MaxNodeID != 0 {
-				filter["$and"] = []bson.M{
-					{"$or": orCond},
-					{"node_id": bson.M{"$lt": req.MaxNodeID}},
-				}
-			} else {
-				filter["$or"] = orCond
-			}
-		} else {
-			// No token: use _id range query
-			idCond := bson.M{}
-			if req.MinNodeID != 0 {
-				idCond["$gte"] = historyNodeDocID(treeID, branchID, req.MinNodeID, 0)
-			}
-			if req.MaxNodeID != 0 {
-				idCond["$lt"] = historyNodeDocID(treeID, branchID, req.MaxNodeID, 0)
-			}
-			if len(idCond) > 0 {
-				filter["_id"] = idCond
-			}
 		}
 	}
+
+	if len(nodeCond) > 0 {
+		filter["node_id"] = nodeCond
+	}
+	if len(idCond) > 0 {
+		filter["_id"] = idCond
+	}
 	return filter
+}
+
+// historyNodeSort returns the sort of ReadHistoryBranch.
+func historyNodeSort(reverseOrder bool) bson.D {
+	if reverseOrder {
+		// Node ID descending, then transaction ID descending. That is the
+		// descending order of _id, which the _id index provides.
+		return bson.D{{Key: "_id", Value: -1}}
+	}
+	// Node ID ascending, then transaction ID descending (to satisfy
+	// history_manager.filterHistoryNodes). Provided by the
+	// {shard_id, tree_id, branch_id, node_id, txn_id: -1} index.
+	return bson.D{
+		{Key: "node_id", Value: 1},
+		{Key: "txn_id", Value: -1},
+	}
 }
 
 type historyBranchListPageToken struct {
@@ -1558,7 +1596,7 @@ func (s *executionStore) buildCurrentExecutionDocument(request *persistence.Inte
 		NamespaceID:      snapshot.NamespaceID,
 		WorkflowID:       snapshot.WorkflowID,
 		RunID:            state.GetRunId(),
-		ArchetypeID:      request.ArchetypeID,
+		ArchetypeID:      storedArchetypeID(request.ArchetypeID),
 		CreateRequestID:  state.GetCreateRequestId(),
 		State:            int32(state.GetState()),
 		Status:           int32(state.GetStatus()),
@@ -1610,7 +1648,7 @@ func (s *executionStore) insertNewCurrentExecution(
 		return &currentExecutionWriteConflictError{
 			namespaceID: doc.NamespaceID,
 			workflowID:  doc.WorkflowID,
-			archetypeID: chasm.ArchetypeID(doc.ArchetypeID),
+			archetypeID: doc.archetype(),
 			message:     message,
 		}
 	}
@@ -1656,7 +1694,7 @@ func (s *executionStore) updateExistingCurrentExecution(
 		return serviceerror.NewUnavailablef("failed to update current execution document: %v", err)
 	}
 	if result.MatchedCount == 0 {
-		existing, loadErr := s.loadCurrentExecution(ctx, doc.NamespaceID, doc.WorkflowID, chasm.ArchetypeID(doc.ArchetypeID))
+		existing, loadErr := s.loadCurrentExecution(ctx, doc.NamespaceID, doc.WorkflowID, doc.archetype())
 		if loadErr != nil {
 			return loadErr
 		}
@@ -1674,7 +1712,7 @@ func (s *executionStore) ensureRunIDMismatch(
 	if doc == nil {
 		return nil
 	}
-	current, err := s.loadCurrentExecution(ctx, doc.NamespaceID, doc.WorkflowID, chasm.ArchetypeID(doc.ArchetypeID))
+	current, err := s.loadCurrentExecution(ctx, doc.NamespaceID, doc.WorkflowID, doc.archetype())
 	if err != nil {
 		return err
 	}
@@ -1808,17 +1846,6 @@ func (s *executionStore) ensureCurrentExecutionIndexes(ctx context.Context) erro
 		model mongo.IndexModel
 	}{
 		{
-			name: "current_executions_namespace_workflow",
-			model: mongo.IndexModel{
-				Keys: bson.D{
-					{Key: "namespace_id", Value: 1},
-					{Key: "workflow_id", Value: 1},
-					{Key: "archetype_id", Value: 1},
-				},
-				Options: options.Index().SetName("current_executions_namespace_workflow_archetype").SetUnique(true),
-			},
-		},
-		{
 			name: "current_executions_shard",
 			model: mongo.IndexModel{
 				Keys: bson.D{
@@ -1831,8 +1858,12 @@ func (s *executionStore) ensureCurrentExecutionIndexes(ctx context.Context) erro
 		},
 	}
 
-	// Drop legacy index that didn't include archetype_id, if it exists.
-	_ = idxView.DropOne(ctx, "current_executions_namespace_workflow")
+	// The unique (namespace_id, workflow_id, archetype_id) index is built by the
+	// primary-indexes-002 migration, which also drops the older unique
+	// (namespace_id, workflow_id) index once the new one exists. It is not built
+	// here because current_executions is populated on existing installations.
+	// Uniqueness does not depend on it in the meantime: _id is derived from the
+	// same fields (currentExecutionDocID).
 
 	for _, spec := range indexes {
 		if _, err := idxView.CreateOne(ctx, spec.model); err != nil && !isDuplicateIndexError(err) {
@@ -2900,23 +2931,8 @@ func (s *executionStore) ReadHistoryBranch(
 
 	filter := historyNodeFilter(request.ShardID, treeID, branchID, request, token)
 
-	var sortSpec bson.D
-	if request.ReverseOrder {
-		// Reverse: NodeID DESC, TxnID DESC
-		sortSpec = bson.D{
-			{Key: "node_id", Value: -1},
-			{Key: "txn_id", Value: -1},
-		}
-	} else {
-		// Forward: NodeID ASC, TxnID DESC (to satisfy history_manager.filterHistoryNodes)
-		sortSpec = bson.D{
-			{Key: "node_id", Value: 1},
-			{Key: "txn_id", Value: -1},
-		}
-	}
-
 	findOpts := options.Find().
-		SetSort(sortSpec).
+		SetSort(historyNodeSort(request.ReverseOrder)).
 		SetLimit(int64(limit))
 
 	cursor, err := s.historyNodesCol.Find(ctx, filter, findOpts)

@@ -45,6 +45,14 @@ type (
 		clusterMDStore     p.ClusterMetadataStore
 		nexusEndpointStore p.NexusEndpointStore
 		visibilityStore    store.VisibilityStore
+
+		// Background index migrations, see index_migration.go. The context is
+		// nil for factories that were not built by NewFactory.
+		migrationCtx            context.Context
+		migrationCancel         context.CancelFunc
+		migrationWG             sync.WaitGroup
+		primaryMigrationOnce    sync.Once
+		visibilityMigrationOnce sync.Once
 	}
 )
 
@@ -68,7 +76,37 @@ func NewFactory(
 		return nil, fmt.Errorf("failed to initialize MongoDB factory: %w", err)
 	}
 
+	factory.migrationCtx, factory.migrationCancel = context.WithCancel(context.Background())
+
 	return factory, nil
+}
+
+// startIndexMigration runs an index migration in the background, once per
+// factory. It never blocks or fails the caller: the outcome is logged and
+// recorded in the schema_migrations collection. When index migrations are
+// disabled in the config it only reports the missing indexes.
+func (f *Factory) startIndexMigration(once *sync.Once, migrations ...indexMigration) {
+	if f.migrationCtx == nil {
+		return
+	}
+	once.Do(func() {
+		f.migrationWG.Add(1)
+		go func() {
+			defer f.migrationWG.Done()
+			migrator := newIndexMigrator(f.database, f.logger)
+			// The migrations run one after the other, in order.
+			for _, migration := range migrations {
+				if f.migrationCtx.Err() != nil {
+					return
+				}
+				if f.cfg.DisableIndexMigration {
+					migrator.report(f.migrationCtx, migration)
+					continue
+				}
+				migrator.run(f.migrationCtx, migration)
+			}
+		}()
+	})
 }
 
 // initialize establishes MongoDB connection and detects topology
@@ -188,8 +226,33 @@ func (f *Factory) buildConnectionString() string {
 	return uri
 }
 
+// RunIndexMigrations runs the index migrations synchronously and returns an
+// error unless every index is in place afterwards. Servers do not call this:
+// they run the migrations in the background (startIndexMigration). It is for
+// tools and test fixtures that want every index in place before the database
+// is used, and it expects the primary and the visibility collections in the
+// database of this factory.
+func (f *Factory) RunIndexMigrations(ctx context.Context) error {
+	for _, migration := range append(primaryIndexMigrations(), visibilityIndexMigration()) {
+		outcome := newIndexMigrator(f.database, f.logger).run(ctx, migration)
+		switch outcome {
+		case indexMigrationCompleted, indexMigrationAlreadyCompleted:
+		default:
+			return fmt.Errorf("mongodb index migration %s did not complete: %s", migration.ID, outcome)
+		}
+	}
+	return nil
+}
+
 // Close closes the factory and underlying connections
 func (f *Factory) Close() {
+	// Stop background index migrations before the client goes away. An
+	// interrupted migration releases its lease and continues on a later start.
+	if f.migrationCancel != nil {
+		f.migrationCancel()
+		f.migrationWG.Wait()
+	}
+
 	if f.client != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -317,6 +380,7 @@ func (f *Factory) NewExecutionStore() (p.ExecutionStore, error) {
 	}
 
 	f.executionStore = executionStore
+	f.startIndexMigration(&f.primaryMigrationOnce, primaryIndexMigrations()...)
 	return executionStore, nil
 }
 
@@ -400,6 +464,7 @@ func (f *Factory) NewVisibilityStore(
 		return nil, err
 	}
 
+	f.startIndexMigration(&f.visibilityMigrationOnce, visibilityIndexMigration())
 	return visStore, nil
 }
 
