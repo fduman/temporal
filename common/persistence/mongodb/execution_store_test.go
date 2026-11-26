@@ -470,6 +470,7 @@ func TestCreateWorkflowExecution_AppendsNewEvents(t *testing.T) {
 		RangeID int64 `bson:"range_id"`
 	}{RangeID: 2})
 	shardDB := newFakeMongoDatabase(t)
+	shardCol.enqueueUpdateResult(&mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1})
 	shardDB.collections[collectionShards] = shardCol
 	store.db = shardDB
 
@@ -524,6 +525,7 @@ func TestUpdateWorkflowExecution_AppendsNewEvents(t *testing.T) {
 		RangeID int64 `bson:"range_id"`
 	}{RangeID: 2})
 	shardDB := newFakeMongoDatabase(t)
+	shardCol.enqueueUpdateResult(&mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1})
 	shardDB.collections[collectionShards] = shardCol
 	store.db = shardDB
 
@@ -597,6 +599,7 @@ func TestConflictResolveWorkflowExecution_AppendsNewEvents(t *testing.T) {
 		RangeID int64 `bson:"range_id"`
 	}{RangeID: 2})
 	shardDB := newFakeMongoDatabase(t)
+	shardCol.enqueueUpdateResult(&mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1})
 	shardDB.collections[collectionShards] = shardCol
 	store.db = shardDB
 
