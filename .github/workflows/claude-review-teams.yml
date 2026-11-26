@@ -6,12 +6,9 @@
 # checks.
 name: Claude review for opted-in PRs
 
-# DISABLED: This workflow requires upstream Temporal secrets (ANTHROPIC_API_KEY,
-# TEMPORAL_AI_REVIEW_APP_ID) and temporalio team membership checks.
 on:
-  workflow_dispatch: # Disabled automatic trigger
-  # pull_request_target:
-  #   types: [opened, reopened, ready_for_review, labeled]
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, labeled]
 
 env:
   # Space- or newline-separated list of temporalio team slugs whose
