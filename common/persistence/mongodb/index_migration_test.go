@@ -334,29 +334,38 @@ func TestIndexMigration_SupersedesPrefixIndex(t *testing.T) {
 	require.NotEmpty(t, doc.Indexes[0].Notes)
 }
 
-// primary-indexes-002 lets a CHASM execution share its business ID with a
-// workflow: the old unique (namespace_id, workflow_id) index is replaced by one
-// that includes archetype_id, and workflow rows without archetype_id stay valid.
-func TestIndexMigration_ArchetypeUniqueIndexReplacesWorkflowIndex(t *testing.T) {
+// primary-indexes-002 adds the unique (namespace_id, workflow_id, archetype_id)
+// index and leaves the older unique (namespace_id, workflow_id) index of an
+// existing installation in place, because v1.30 nodes recreate it on start.
+func TestIndexMigration_ArchetypeUniqueIndexKeepsWorkflowIndex(t *testing.T) {
 	env := newIndexMigrationEnv(t)
-	col := env.raw.Collection("current_executions")
 	env.createIndex(t, "current_executions", "current_executions_namespace_workflow",
 		bson.D{{Key: "namespace_id", Value: 1}, {Key: "workflow_id", Value: 1}}, true)
-	_, err := col.InsertOne(testCtx(t), bson.M{"_id": "ns|wf", "namespace_id": "ns", "workflow_id": "wf"})
-	require.NoError(t, err)
-	_, err = col.InsertOne(testCtx(t), bson.M{"_id": "ns|wf|7", "namespace_id": "ns", "workflow_id": "wf", "archetype_id": 7})
-	require.Error(t, err, "the old index rejects a CHASM row with the workflow's business ID")
 
 	migration := mongodb.PrimaryIndexMigrationArchetypeForTest()
 	require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
 
 	indexes := env.indexes(t, "current_executions")
 	require.True(t, indexes["current_executions_namespace_workflow_archetype"].Unique)
-	require.NotContains(t, indexes, "current_executions_namespace_workflow")
+	require.Contains(t, indexes, "current_executions_namespace_workflow", "the older index must not be dropped")
+	require.Empty(t, env.record(t, migration.ID).Indexes[0].Dropped)
+}
 
-	_, err = col.InsertOne(testCtx(t), bson.M{"_id": "ns|wf|7", "namespace_id": "ns", "workflow_id": "wf", "archetype_id": 7})
+// On a database created by this version there is no older index, so a CHASM
+// execution may share its business ID with a workflow, while two rows of the
+// same archetype are still rejected.
+func TestIndexMigration_ArchetypeUniqueIndexOnNewDatabase(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	col := env.raw.Collection("current_executions")
+
+	migration := mongodb.PrimaryIndexMigrationArchetypeForTest()
+	require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
+
+	_, err := col.InsertOne(testCtx(t), bson.M{"_id": "wf-row", "namespace_id": "ns", "workflow_id": "wf"})
 	require.NoError(t, err)
-	_, err = col.InsertOne(testCtx(t), bson.M{"_id": "ns|wf|7b", "namespace_id": "ns", "workflow_id": "wf", "archetype_id": 7})
+	_, err = col.InsertOne(testCtx(t), bson.M{"_id": "chasm-row", "namespace_id": "ns", "workflow_id": "wf", "archetype_id": 7})
+	require.NoError(t, err)
+	_, err = col.InsertOne(testCtx(t), bson.M{"_id": "chasm-row-2", "namespace_id": "ns", "workflow_id": "wf", "archetype_id": 7})
 	require.Error(t, err, "the new index still rejects a second row of the same archetype")
 }
 

@@ -24,11 +24,10 @@
 //     and the conflict is reported;
 //   - an index that cannot be created (for example a unique index over data
 //     that contains duplicates) is reported and skipped, the rest still runs;
-//   - no index is dropped, except the ones listed in obsoleteIndexes: indexes
-//     that earlier versions of this script created by mistake, or that a
-//     migration supersedes (Supersedes in the Go definition). Such an index is
-//     only dropped while it still has the old definition and after the index
-//     that replaces it is in place.
+//   - no index is dropped, except the ones listed in obsoleteIndexes, which
+//     earlier versions of this script created by mistake. Such an index is
+//     only dropped while it still has the faulty definition and after the
+//     index that replaces it is in place.
 //
 // The script exits with a non-zero status if any index could not be created.
 
@@ -363,21 +362,6 @@
       replacedBy: {
         name: "task_queue_lookup",
         keys: { namespace_id: 1, task_queue: 1, task_type: 1, subqueue: 1 },
-      },
-    },
-    {
-      database: primaryDb,
-      collection: "current_executions",
-      name: "current_executions_namespace_workflow",
-      // Superseded by the unique index that includes archetype_id (migration
-      // primary-indexes-002): a CHASM execution may share its business ID with
-      // a workflow, which this index rejects.
-      keys: { namespace_id: 1, workflow_id: 1 },
-      unique: true,
-      replacedBy: {
-        name: "current_executions_namespace_workflow_archetype",
-        keys: { namespace_id: 1, workflow_id: 1, archetype_id: 1 },
-        options: { unique: true },
       },
     },
   ];

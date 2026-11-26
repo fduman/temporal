@@ -269,16 +269,23 @@ func primaryIndexMigration() indexMigration {
 	}
 }
 
-// primaryIndexMigrationArchetype moves the uniqueness of current executions
-// from (namespace_id, workflow_id) to (namespace_id, workflow_id, archetype_id).
-// Since v1.31 a CHASM execution (standalone activity, scheduler, ...) may share
-// its business ID with a workflow, which the old unique index rejects.
+// primaryIndexMigrationArchetype adds the unique (namespace_id, workflow_id,
+// archetype_id) index on current executions. Since v1.31 a CHASM execution
+// (standalone activity, scheduler, ...) may share its business ID with a
+// workflow, which the older unique (namespace_id, workflow_id) index rejects.
 //
 // Workflow rows do not store archetype_id (see currentExecutionDocument), the
 // same way SQL keeps them in current_executions and only CHASM rows carry an
 // archetype in current_chasm_executions. They are therefore indexed as null and
-// need no backfill. The old index is dropped only after the new one exists, so
-// the collection is never without a unique index on these fields.
+// need no backfill.
+//
+// The older index is deliberately NOT dropped here: v1.30 builds recreate it
+// synchronously on every start, so dropping it while such a node may still
+// start (rolling upgrade, rollback) would make that node rebuild a unique
+// index on a populated collection. It is to be dropped by a later migration
+// (Supersedes) once no v1.30 binary can run against the database. Until then a
+// CHASM execution that reuses a workflow's business ID is rejected by the old
+// index; databases created by this version never have it.
 func primaryIndexMigrationArchetype() indexMigration {
 	return indexMigration{
 		ID: "primary-indexes-002",
@@ -292,7 +299,6 @@ func primaryIndexMigrationArchetype() indexMigration {
 					{Key: "archetype_id", Value: 1},
 				},
 				Unique:     true,
-				Supersedes: []string{"current_executions_namespace_workflow"},
 			},
 		},
 	}
