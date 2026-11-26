@@ -13,6 +13,7 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
+	visibilityservice "go.temporal.io/server/api/visibilityservice/v1"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
@@ -111,7 +112,9 @@ func NewVisibilityStore(
 		saProvider = searchattribute.NewSystemProvider()
 	}
 	if saMapperProvider == nil {
-		saMapperProvider = searchattribute.NewMapperProvider(nil, nil, saProvider, false)
+		// No namespace registry is available here, so use an identity mapper
+		// (same behaviour as the pre-1.32 noop default).
+		saMapperProvider = searchattribute.NewMapperProvider(&searchattribute.NoopMapper{}, nil, saProvider, "")
 	}
 
 	vs := &visibilityStore{
@@ -526,20 +529,20 @@ func (s *visibilityStore) ListWorkflowExecutions(ctx context.Context, request *m
 	return buildListResponse(docs, pageSize, saTypeMap)
 }
 
-func (s *visibilityStore) ListChasmExecutions(ctx context.Context, request *manager.ListChasmExecutionsRequest) (*store.InternalListExecutionsResponse, error) {
+func (s *visibilityStore) ListChasmExecutions(ctx context.Context, request *visibilityservice.ListChasmExecutionsRequest) (*store.InternalListExecutionsResponse, error) {
 	if request == nil {
 		return nil, serviceerror.NewInvalidArgument("ListChasmExecutions request is nil")
 	}
-	if request.NamespaceID == namespace.EmptyID {
+	if request.NamespaceId == "" {
 		return nil, serviceerror.NewInvalidArgument("namespace ID is required")
 	}
 	if s.chasmRegistry == nil {
 		return nil, serviceerror.NewUnavailable("chasm registry not configured")
 	}
 
-	rc, ok := s.chasmRegistry.ComponentByID(request.ArchetypeID)
+	rc, ok := s.chasmRegistry.ComponentByID(request.ArchetypeId)
 	if !ok {
-		return nil, serviceerror.NewInvalidArgument(fmt.Sprintf("unknown archetype ID: %d", request.ArchetypeID))
+		return nil, serviceerror.NewInvalidArgument(fmt.Sprintf("unknown archetype ID: %d", request.ArchetypeId))
 	}
 	mapper := rc.SearchAttributesMapper()
 
@@ -548,15 +551,15 @@ func (s *visibilityStore) ListChasmExecutions(ctx context.Context, request *mana
 		pageSize = 1000
 	}
 
-	filters := []bson.M{{"namespace_id": string(request.NamespaceID)}}
+	filters := []bson.M{{"namespace_id": request.NamespaceId}}
 
 	qFilter, err := s.buildQueryFilter(
 		ctx,
-		request.NamespaceID,
-		request.Namespace,
+		namespace.ID(request.NamespaceId),
+		namespace.Name(request.Namespace),
 		request.Query,
 		mapper,
-		request.ArchetypeID,
+		request.ArchetypeId,
 	)
 	if err != nil {
 		return nil, err
@@ -614,14 +617,14 @@ func (s *visibilityStore) ListChasmExecutions(ctx context.Context, request *mana
 	return buildListResponse(docs, pageSize, saTypeMap)
 }
 
-func (s *visibilityStore) CountChasmExecutions(ctx context.Context, request *manager.CountChasmExecutionsRequest) (*store.InternalCountExecutionsResponse, error) {
+func (s *visibilityStore) CountChasmExecutions(ctx context.Context, request *visibilityservice.CountChasmExecutionsRequest) (*store.InternalCountExecutionsResponse, error) {
 	if err := s.validateCountChasmRequest(request); err != nil {
 		return nil, err
 	}
 
-	rc, ok := s.chasmRegistry.ComponentByID(request.ArchetypeID)
+	rc, ok := s.chasmRegistry.ComponentByID(request.ArchetypeId)
 	if !ok {
-		return nil, serviceerror.NewInvalidArgument(fmt.Sprintf("unknown archetype ID: %d", request.ArchetypeID))
+		return nil, serviceerror.NewInvalidArgument(fmt.Sprintf("unknown archetype ID: %d", request.ArchetypeId))
 	}
 
 	filter, params, err := s.buildChasmFilter(ctx, request, rc.SearchAttributesMapper())
@@ -641,11 +644,11 @@ func (s *visibilityStore) CountChasmExecutions(ctx context.Context, request *man
 	return &store.InternalCountExecutionsResponse{Count: count}, nil
 }
 
-func (s *visibilityStore) validateCountChasmRequest(request *manager.CountChasmExecutionsRequest) error {
+func (s *visibilityStore) validateCountChasmRequest(request *visibilityservice.CountChasmExecutionsRequest) error {
 	if request == nil {
 		return serviceerror.NewInvalidArgument("CountChasmExecutions request is nil")
 	}
-	if request.NamespaceID == namespace.EmptyID {
+	if request.NamespaceId == "" {
 		return serviceerror.NewInvalidArgument("namespace ID is required")
 	}
 	if s.chasmRegistry == nil {
@@ -654,14 +657,14 @@ func (s *visibilityStore) validateCountChasmRequest(request *manager.CountChasmE
 	return nil
 }
 
-func (s *visibilityStore) buildChasmFilter(ctx context.Context, request *manager.CountChasmExecutionsRequest, mapper *chasm.VisibilitySearchAttributesMapper) (bson.M, *query.QueryParams[bson.M], error) {
-	filter := mongoAnd(bson.M{"namespace_id": string(request.NamespaceID)})
+func (s *visibilityStore) buildChasmFilter(ctx context.Context, request *visibilityservice.CountChasmExecutionsRequest, mapper *chasm.VisibilitySearchAttributesMapper) (bson.M, *query.QueryParams[bson.M], error) {
+	filter := mongoAnd(bson.M{"namespace_id": request.NamespaceId})
 
 	if request.Query == "" {
 		return filter, nil, nil
 	}
 
-	params, err := s.convertQueryParams(ctx, request.NamespaceID, request.Namespace, request.Query, mapper, request.ArchetypeID)
+	params, err := s.convertQueryParams(ctx, namespace.ID(request.NamespaceId), namespace.Name(request.Namespace), request.Query, mapper, request.ArchetypeId)
 	if err != nil {
 		var converterErr *query.ConverterError
 		if errors.As(err, &converterErr) {
@@ -983,6 +986,8 @@ func (s *visibilityStore) convertQueryParams(
 		nsName,
 		combinedTypeMap,
 		mapper,
+		s.metricsHandler,
+		s.logger,
 	).WithChasmMapper(chasmMapper).WithArchetypeID(archetypeID)
 
 	params, err := converter.Convert(queryString)
@@ -1045,7 +1050,7 @@ func encodeGroupValuePayload(col *query.SAColumn, raw any) (*commonpb.Payload, e
 		// No additional normalization required for other types.
 	}
 
-	payload, err := searchattribute.EncodeValue(value, col.ValueType)
+	payload, err := sadefs.EncodeValue(value, col.ValueType)
 	if err != nil {
 		return nil, serviceerror.NewInternalf("failed to encode aggregation value for %s: %v", col.FieldName, err)
 	}
@@ -1146,7 +1151,7 @@ func (s *visibilityStore) renderSearchAttributes(ctx context.Context, sa *common
 			valueType = vType
 		}
 
-		decoded, err := searchattribute.DecodeValue(payload, valueType, true)
+		decoded, err := sadefs.DecodeValue(payload, valueType, true)
 		if err != nil {
 			return nil, serviceerror.NewInternalf("failed to decode search attribute %q: %v", name, err)
 		}

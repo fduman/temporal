@@ -14,6 +14,7 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
+	visibilityservice "go.temporal.io/server/api/visibilityservice/v1"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/log"
@@ -24,6 +25,7 @@ import (
 	"go.temporal.io/server/common/persistence/visibility/manager"
 	storepkg "go.temporal.io/server/common/persistence/visibility/store"
 	"go.temporal.io/server/common/searchattribute"
+	"go.temporal.io/server/common/searchattribute/sadefs"
 )
 
 func TestVisibilityStoreConstructs(t *testing.T) {
@@ -50,7 +52,7 @@ func TestVisibilityStoreRecordWorkflowExecutionStarted(t *testing.T) {
 	startTime := time.Now().UTC()
 	execTime := startTime.Add(5 * time.Second)
 	memo := persistence.NewDataBlob([]byte("memo"), enumspb.ENCODING_TYPE_JSON.String())
-	payload, encodeErr := searchattribute.EncodeValue("value", enumspb.INDEXED_VALUE_TYPE_KEYWORD)
+	payload, encodeErr := sadefs.EncodeValue("value", enumspb.INDEXED_VALUE_TYPE_KEYWORD)
 	require.NoError(t, encodeErr)
 	sa := &commonpb.SearchAttributes{IndexedFields: map[string]*commonpb.Payload{
 		"CustomKeyword": payload,
@@ -247,10 +249,10 @@ func TestVisibilityStoreListChasmExecutions(t *testing.T) {
 		Status:           int32(enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING),
 	})
 
-	resp, err := store.ListChasmExecutions(context.Background(), &manager.ListChasmExecutionsRequest{
-		ArchetypeID: archetypeID,
-		NamespaceID: namespace.ID("ns"),
-		Namespace:   namespace.Name("ns"),
+	resp, err := store.ListChasmExecutions(context.Background(), &visibilityservice.ListChasmExecutionsRequest{
+		ArchetypeId: archetypeID,
+		NamespaceId: "ns",
+		Namespace:   "ns",
 		PageSize:    1,
 		Query:       "status = 'READY'",
 	})
@@ -267,10 +269,10 @@ func TestVisibilityStoreListChasmExecutions(t *testing.T) {
 
 func TestVisibilityStoreListChasmExecutionsUnknownArchetype(t *testing.T) {
 	store := buildVisibilityStoreWithChasm(t, newFakeChasmRegistry())
-	_, err := store.ListChasmExecutions(context.Background(), &manager.ListChasmExecutionsRequest{
-		ArchetypeID: chasm.ArchetypeID(999),
-		NamespaceID: namespace.ID("ns"),
-		Namespace:   namespace.Name("ns"),
+	_, err := store.ListChasmExecutions(context.Background(), &visibilityservice.ListChasmExecutionsRequest{
+		ArchetypeId: chasm.ArchetypeID(999),
+		NamespaceId: "ns",
+		Namespace:   "ns",
 	})
 	require.Error(t, err)
 	_, isInvalid := err.(*serviceerror.InvalidArgument)
@@ -291,10 +293,10 @@ func TestVisibilityStoreCountChasmExecutions(t *testing.T) {
 	col := store.executionsCol.(*fakeVisibilityCollection)
 	col.countResult = 9
 
-	resp, err := store.CountChasmExecutions(context.Background(), &manager.CountChasmExecutionsRequest{
-		ArchetypeID: archetypeID,
-		NamespaceID: namespace.ID("ns"),
-		Namespace:   namespace.Name("ns"),
+	resp, err := store.CountChasmExecutions(context.Background(), &visibilityservice.CountChasmExecutionsRequest{
+		ArchetypeId: archetypeID,
+		NamespaceId: "ns",
+		Namespace:   "ns",
 		Query:       "status = 'READY'",
 	})
 	require.NoError(t, err)
@@ -407,7 +409,7 @@ func TestVisibilityStoreCountWorkflowExecutions_GroupBy(t *testing.T) {
 	require.Len(t, resp.Groups, 1)
 	require.Equal(t, int64(5), resp.Groups[0].Count)
 
-	decoded, err := searchattribute.DecodeValue(resp.Groups[0].GroupValues[0], enumspb.INDEXED_VALUE_TYPE_KEYWORD, false)
+	decoded, err := sadefs.DecodeValue(resp.Groups[0].GroupValues[0], enumspb.INDEXED_VALUE_TYPE_KEYWORD, false)
 	require.NoError(t, err)
 	require.Equal(t, enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING.String(), decoded)
 

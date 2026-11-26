@@ -68,7 +68,7 @@ func NewTestBaseWithMongoDB(opts *TestBaseOptions) *TestBase {
 		cfgCopy.DatabaseName = opts.DBName
 	}
 	if cfgCopy.DatabaseName == "" {
-		cfgCopy.DatabaseName = "test_" + GenerateRandomDBName(4) + "_temporal_persistence"
+		cfgCopy.DatabaseName = GenerateRandomDBName() + "_temporal_persistence"
 	}
 	if len(cfgCopy.Hosts) == 0 {
 		host := net.JoinHostPort(environment.GetMongoDBAddress(), strconv.Itoa(environment.GetMongoDBPort()))
@@ -101,7 +101,7 @@ func GetMongoDBTestClusterOption() *TestBaseOptions {
 		Password:       "temporal",
 		AuthSource:     "admin",
 		Hosts:          []string{host},
-		DatabaseName:   "test_" + GenerateRandomDBName(4) + "_temporal_persistence",
+		DatabaseName:   GenerateRandomDBName() + "_temporal_persistence",
 		MaxConns:       200,
 		MinConns:       20,
 		ConnectTimeout: 10 * time.Second,
