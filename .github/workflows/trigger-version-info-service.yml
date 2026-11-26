@@ -1,12 +1,11 @@
-# DISABLED: This workflow requires upstream Temporal secrets (TEMPORAL_CICD_APP_ID, TEMPORAL_CICD_PRIVATE_KEY)
-# that are not available in this fork. Re-enable if you have access to version-info-service repository.
 name: 'Trigger version-info-service release'
 
 on:
-  workflow_dispatch: # Disabled automatic trigger, only manual
-  # release:
-  #   types:
-  #     - published
+  release:
+    types:
+      - published
+permissions:
+  contents: read
 
 jobs:
   trigger-vis:
@@ -25,7 +24,8 @@ jobs:
           app-id: ${{ secrets.TEMPORAL_CICD_APP_ID }}
           private-key: ${{ secrets.TEMPORAL_CICD_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          repositories: version-info-service
+          repositories: |
+            version-info-service
 
       - name: Dispatch version-info-service Github Action
         env:
