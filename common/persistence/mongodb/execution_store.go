@@ -271,11 +271,18 @@ func executionDocID(namespaceID, workflowID, runID string) string {
 	return fmt.Sprintf("%s|%s|%s", namespaceID, workflowID, runID)
 }
 
+// currentExecutionDocID returns the _id of a current_executions row.
+//
+// Workflow rows keep the "namespace|workflow" format. CHASM rows put the
+// archetype first ("archetype#namespace|workflow"). The old CHASM format
+// ("namespace|workflow|archetype") could collide with a workflow row whose
+// workflow ID ends in "|<number>". Namespace IDs never contain '#' or '|', so
+// the two formats can't produce the same _id.
 func currentExecutionDocID(namespaceID, workflowID string, archetypeID chasm.ArchetypeID) string {
 	if archetypeID == chasm.UnspecifiedArchetypeID || archetypeID == chasm.WorkflowArchetypeID {
 		return fmt.Sprintf("%s|%s", namespaceID, workflowID)
 	}
-	return fmt.Sprintf("%s|%s|%d", namespaceID, workflowID, archetypeID)
+	return fmt.Sprintf("%d#%s|%s", archetypeID, namespaceID, workflowID)
 }
 
 func timePtrFromProto(ts *timestamppb.Timestamp) *time.Time {

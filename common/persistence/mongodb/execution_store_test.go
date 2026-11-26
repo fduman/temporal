@@ -1296,3 +1296,23 @@ func (noopIndexView) CreateOne(context.Context, mongo.IndexModel, ...*options.Cr
 func (noopIndexView) DropOne(context.Context, string, ...*options.DropIndexesOptions) error {
 	return nil
 }
+
+func TestCurrentExecutionDocID_NoCollisionBetweenWorkflowAndChasm(t *testing.T) {
+	nsID := "8f3c2d5e-1b4a-4c6d-9e7f-0a1b2c3d4e5f"
+
+	require.Equal(t, nsID+"|wf", currentExecutionDocID(nsID, "wf", chasm.UnspecifiedArchetypeID))
+	require.Equal(t, nsID+"|wf", currentExecutionDocID(nsID, "wf", chasm.WorkflowArchetypeID))
+	require.Equal(t, "7#"+nsID+"|wf", currentExecutionDocID(nsID, "wf", chasm.ArchetypeID(7)))
+
+	// A workflow whose ID looks like "<id>|<archetype>" must not share a row
+	// with the CHASM execution "<id>" of that archetype.
+	workflowRow := currentExecutionDocID(nsID, "wf|7", chasm.WorkflowArchetypeID)
+	chasmRow := currentExecutionDocID(nsID, "wf", chasm.ArchetypeID(7))
+	require.NotEqual(t, workflowRow, chasmRow)
+
+	// Different archetypes for the same business ID get different rows.
+	require.NotEqual(t,
+		currentExecutionDocID(nsID, "wf", chasm.ArchetypeID(7)),
+		currentExecutionDocID(nsID, "wf", chasm.ArchetypeID(8)),
+	)
+}
