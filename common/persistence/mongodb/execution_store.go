@@ -1743,9 +1743,10 @@ func (s *executionStore) ensureCurrentExecutionIndexes(ctx context.Context) erro
 	}
 
 	// The unique (namespace_id, workflow_id, archetype_id) index is built by the
-	// primary-indexes-002 migration, which also drops the older unique
-	// (namespace_id, workflow_id) index once the new one exists. It is not built
-	// here because current_executions is populated on existing installations.
+	// primary-indexes-002 migration (the older unique (namespace_id, workflow_id)
+	// index of existing installations is left in place, see that migration). It
+	// is not built here because current_executions is populated on existing
+	// installations.
 	// Uniqueness does not depend on it in the meantime: _id is derived from the
 	// same fields (currentExecutionDocID).
 
