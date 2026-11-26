@@ -282,6 +282,8 @@ func mongoFieldName(saField string) (string, error) {
 		return "parent_run_id", nil
 	case sadefs.RootWorkflowID:
 		return "root_workflow_id", nil
+	case sadefs.RootRunID:
+		return "root_run_id", nil
 	default:
 		if strings.HasPrefix(saField, sadefs.ReservedPrefix) {
 			return "search_attributes." + saField, nil
