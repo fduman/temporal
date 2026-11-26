@@ -1602,7 +1602,10 @@ func (s *executionStore) currentWorkflowConflictError(
 		return &persistence.CurrentWorkflowConditionFailedError{Msg: message}
 	}
 
-	var requestIDs map[string]*persistencespb.RequestIDInfo
+	var (
+		requestIDs          map[string]*persistencespb.RequestIDInfo
+		firstExecutionRunID string
+	)
 	execDoc, err := s.loadExecutionDocument(ctx, doc.NamespaceID, doc.WorkflowID, doc.RunID)
 	if err != nil {
 		return err
@@ -1615,17 +1618,19 @@ func (s *executionStore) currentWorkflowConflictError(
 				return serviceerror.NewUnavailablef("failed to deserialize execution state for current workflow conflict: %v", stateErr)
 			}
 			requestIDs = executionState.RequestIds
+			firstExecutionRunID = executionState.FirstExecutionRunId
 		}
 	}
 
 	return &persistence.CurrentWorkflowConditionFailedError{
-		Msg:              message,
-		RequestIDs:       requestIDs,
-		RunID:            doc.RunID,
-		State:            enumsspb.WorkflowExecutionState(doc.State),
-		Status:           enumspb.WorkflowExecutionStatus(doc.Status),
-		LastWriteVersion: doc.LastWriteVersion,
-		StartTime:        doc.StartTime,
+		Msg:                 message,
+		RequestIDs:          requestIDs,
+		RunID:               doc.RunID,
+		FirstExecutionRunID: firstExecutionRunID,
+		State:               enumsspb.WorkflowExecutionState(doc.State),
+		Status:              enumspb.WorkflowExecutionStatus(doc.Status),
+		LastWriteVersion:    doc.LastWriteVersion,
+		StartTime:           doc.StartTime,
 	}
 }
 
@@ -1964,11 +1969,12 @@ func (s *executionStore) applyConflictResolveWorkflowExecution(
 				if workflowErr, ok := err.(*persistence.WorkflowConditionFailedError); ok {
 					if strings.Contains(workflowErr.Msg, "not found") {
 						return &persistence.CurrentWorkflowConditionFailedError{
-							Msg:              workflowErr.Msg,
-							RunID:            request.CurrentWorkflowMutation.ExecutionState.GetRunId(),
-							State:            request.CurrentWorkflowMutation.ExecutionState.GetState(),
-							Status:           request.CurrentWorkflowMutation.ExecutionState.GetStatus(),
-							LastWriteVersion: request.CurrentWorkflowMutation.LastWriteVersion,
+							Msg:                 workflowErr.Msg,
+							RunID:               request.CurrentWorkflowMutation.ExecutionState.GetRunId(),
+							FirstExecutionRunID: request.CurrentWorkflowMutation.ExecutionState.GetFirstExecutionRunId(),
+							State:               request.CurrentWorkflowMutation.ExecutionState.GetState(),
+							Status:              request.CurrentWorkflowMutation.ExecutionState.GetStatus(),
+							LastWriteVersion:    request.CurrentWorkflowMutation.LastWriteVersion,
 						}
 					}
 				}

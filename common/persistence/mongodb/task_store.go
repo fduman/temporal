@@ -548,21 +548,24 @@ func (s *taskStore) CreateTasks(
 
 	var response *persistence.CreateTasksResponse
 	_, txErr := sess.WithTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
-		// Step 1: Verify RangeID FIRST (write fence)
-		queueFilter := bson.M{"_id": queueID, "range_id": request.RangeID}
-		queueUpdate := bson.M{"$set": bson.M{
-			"data":          request.TaskQueueInfo.Data,
-			"data_encoding": request.TaskQueueInfo.EncodingType.String(),
-			"updated_at":    time.Now().UTC(),
-		}}
-
-		res, err := s.db.Collection(collectionTaskQueues).UpdateOne(sessCtx, queueFilter, queueUpdate)
-		if err != nil {
-			return nil, serviceerror.NewUnavailablef("CreateTasks: failed to update queue: %v", err)
+		// Step 1: Verify RangeID FIRST (write fence). The task queue metadata is
+		// only rewritten when the caller asks for it; otherwise TaskQueueInfo is
+		// nil and only the range_id fence is applied (same as SQL/Cassandra).
+		var queueUpdate bson.M
+		if request.UpdateMetadata {
+			if request.TaskQueueInfo == nil {
+				return nil, serviceerror.NewInternal("CreateTasks: UpdateMetadata set without TaskQueueInfo")
+			}
+			queueUpdate = bson.M{"$set": bson.M{
+				"data":          request.TaskQueueInfo.Data,
+				"data_encoding": request.TaskQueueInfo.EncodingType.String(),
+				"updated_at":    time.Now().UTC(),
+			}}
+		} else {
+			queueUpdate = rangeFenceUpdate()
 		}
-		if res.MatchedCount == 0 {
-			// RangeID mismatch - transaction will abort, no tasks written
-			return nil, &persistence.ConditionFailedError{Msg: "task queue range mismatch"}
+		if err := s.fenceTaskQueueRange(sessCtx, queueID, request.RangeID, queueUpdate); err != nil {
+			return nil, err
 		}
 
 		// Step 2: Insert all tasks in one batch operation
@@ -575,7 +578,7 @@ func (s *taskStore) CreateTasks(
 			return nil, serviceerror.NewUnavailablef("CreateTasks: batch insert failed: %v", err)
 		}
 
-		response = &persistence.CreateTasksResponse{UpdatedMetadata: true}
+		response = &persistence.CreateTasksResponse{UpdatedMetadata: request.UpdateMetadata}
 		return nil, nil
 	})
 
@@ -640,6 +643,11 @@ func (s *taskStore) CompleteTasksLessThan(
 		"subqueue":     request.Subqueue,
 	}
 
+	if !s.fairnessEnabled && request.ConditionRangeID != 0 {
+		// Classic queues never send a range condition (matches sql/task_v1.go).
+		return 0, serviceerror.NewInternal("invalid CompleteTasksLessThan request on queue")
+	}
+
 	if s.fairnessEnabled {
 		if request.ExclusiveMaxPass == 0 {
 			// V1 request - delete tasks with TaskPass=0
@@ -664,16 +672,66 @@ func (s *taskStore) CompleteTasksLessThan(
 		}
 	}
 
-	res, err := s.db.Collection(collectionTasks).DeleteMany(ctx, filter)
-	if err != nil {
-		return 0, serviceerror.NewUnavailablef("CompleteTasksLessThan failed: %v", err)
+	var deleted int64
+	if request.ConditionRangeID == 0 {
+		res, err := s.db.Collection(collectionTasks).DeleteMany(ctx, filter)
+		if err != nil {
+			return 0, serviceerror.NewUnavailablef("CompleteTasksLessThan failed: %v", err)
+		}
+		deleted = res.DeletedCount
+	} else {
+		// Fair queues: only delete while we still own the task queue. The range_id
+		// lives on the subqueue-zero queue document; fencing it with a real write in
+		// the same transaction makes a concurrent range_id bump conflict with us.
+		queueID := taskQueueDocID(request.NamespaceID, request.TaskQueueName, request.TaskType, persistence.SubqueueZero, s.fairnessEnabled)
+		sess, err := s.mongoClient.StartSession(ctx)
+		if err != nil {
+			return 0, serviceerror.NewUnavailablef("CompleteTasksLessThan: failed to start session: %v", err)
+		}
+		defer sess.EndSession(ctx)
+		_, txErr := sess.WithTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
+			if err := s.fenceTaskQueueRange(sessCtx, queueID, request.ConditionRangeID, rangeFenceUpdate()); err != nil {
+				return nil, err
+			}
+			res, err := s.db.Collection(collectionTasks).DeleteMany(sessCtx, filter)
+			if err != nil {
+				return nil, serviceerror.NewUnavailablef("CompleteTasksLessThan failed: %v", err)
+			}
+			deleted = res.DeletedCount
+			return nil, nil
+		})
+		if txErr != nil {
+			return 0, txErr
+		}
 	}
 
-	if request.Limit > 0 && res.DeletedCount > int64(request.Limit) {
+	if request.Limit > 0 && deleted > int64(request.Limit) {
 		return request.Limit, nil
 	}
 
-	return int(res.DeletedCount), nil
+	return int(deleted), nil
+}
+
+// rangeFenceUpdate is the update applied to a task queue document when only the
+// range_id fence is needed. MongoDB treats a $set to an unchanged value as a
+// no-op that does not take part in write-conflict detection, so the fence has
+// to change the document; incrementing a dedicated counter does that without
+// touching the persisted task queue metadata.
+func rangeFenceUpdate() bson.M {
+	return bson.M{"$inc": bson.M{"range_fence": int64(1)}}
+}
+
+// fenceTaskQueueRange applies update to the task queue document only if its
+// range_id still equals rangeID, and reports a ConditionFailedError otherwise.
+func (s *taskStore) fenceTaskQueueRange(ctx context.Context, queueID string, rangeID int64, update bson.M) error {
+	res, err := s.db.Collection(collectionTaskQueues).UpdateOne(ctx, bson.M{"_id": queueID, "range_id": rangeID}, update)
+	if err != nil {
+		return serviceerror.NewUnavailablef("task queue range fence failed: %v", err)
+	}
+	if res.MatchedCount == 0 {
+		return &persistence.ConditionFailedError{Msg: "task queue range mismatch"}
+	}
+	return nil
 }
 
 // -------- Task queue user data --------
