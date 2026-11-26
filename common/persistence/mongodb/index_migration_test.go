@@ -182,6 +182,7 @@ func TestIndexMigration_CreatesIndexesAndRecordsCompletion(t *testing.T) {
 
 	for _, migration := range []mongodb.IndexMigrationForTest{
 		mongodb.PrimaryIndexMigrationForTest(),
+		mongodb.PrimaryIndexMigrationArchetypeForTest(),
 		mongodb.VisibilityIndexMigrationForTest(),
 	} {
 		require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
@@ -204,7 +205,7 @@ func TestIndexMigration_CreatesIndexesAndRecordsCompletion(t *testing.T) {
 		require.Equal(t, "already_completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
 	}
 
-	require.Equal(t, 2, env.logger.count(&env.logger.infos, "MongoDB index migration completed"))
+	require.Equal(t, 3, env.logger.count(&env.logger.infos, "MongoDB index migration completed"))
 	require.Empty(t, env.logger.errors)
 }
 
@@ -307,6 +308,56 @@ func TestIndexMigration_ReplacesNonUniqueIndex(t *testing.T) {
 	require.Equal(t, []string{"old_idx"}, doc.Indexes[0].Dropped)
 	require.Equal(t, []string{"wanted"}, doc.Indexes[1].Dropped)
 	require.Empty(t, doc.Indexes[2].Dropped)
+}
+
+// Supersedes drops an older index whose keys are a strict prefix of the new
+// index, after the new one exists, and leaves any other index alone.
+func TestIndexMigration_SupersedesPrefixIndex(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	abcKeys := append(append(bson.D{}, abKeys...), bson.E{Key: "c", Value: 1})
+	env.createIndex(t, "coll", "prefix_idx", abKeys, true)
+	env.createIndex(t, "coll", "other_idx", bson.D{{Key: "b", Value: 1}}, false)
+
+	migration := oneIndexMigration("supersede", mongodb.IndexDefinitionForTest{
+		Collection: "coll", Name: "wanted", Keys: abcKeys, Unique: true,
+		Supersedes: []string{"prefix_idx", "other_idx"},
+	})
+	require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
+
+	indexes := env.indexes(t, "coll")
+	require.True(t, indexes["wanted"].Unique)
+	require.NotContains(t, indexes, "prefix_idx", "the superseded prefix index must be dropped")
+	require.Contains(t, indexes, "other_idx", "an index whose keys are not a prefix must never be dropped")
+
+	doc := env.record(t, "supersede")
+	require.Equal(t, []string{"prefix_idx"}, doc.Indexes[0].Dropped)
+	require.NotEmpty(t, doc.Indexes[0].Notes)
+}
+
+// primary-indexes-002 lets a CHASM execution share its business ID with a
+// workflow: the old unique (namespace_id, workflow_id) index is replaced by one
+// that includes archetype_id, and workflow rows without archetype_id stay valid.
+func TestIndexMigration_ArchetypeUniqueIndexReplacesWorkflowIndex(t *testing.T) {
+	env := newIndexMigrationEnv(t)
+	col := env.raw.Collection("current_executions")
+	env.createIndex(t, "current_executions", "current_executions_namespace_workflow",
+		bson.D{{Key: "namespace_id", Value: 1}, {Key: "workflow_id", Value: 1}}, true)
+	_, err := col.InsertOne(testCtx(t), bson.M{"_id": "ns|wf", "namespace_id": "ns", "workflow_id": "wf"})
+	require.NoError(t, err)
+	_, err = col.InsertOne(testCtx(t), bson.M{"_id": "ns|wf|7", "namespace_id": "ns", "workflow_id": "wf", "archetype_id": 7})
+	require.Error(t, err, "the old index rejects a CHASM row with the workflow's business ID")
+
+	migration := mongodb.PrimaryIndexMigrationArchetypeForTest()
+	require.Equal(t, "completed", env.run(t, migration, mongodb.IndexMigrationOptionsForTest{}))
+
+	indexes := env.indexes(t, "current_executions")
+	require.True(t, indexes["current_executions_namespace_workflow_archetype"].Unique)
+	require.NotContains(t, indexes, "current_executions_namespace_workflow")
+
+	_, err = col.InsertOne(testCtx(t), bson.M{"_id": "ns|wf|7", "namespace_id": "ns", "workflow_id": "wf", "archetype_id": 7})
+	require.NoError(t, err)
+	_, err = col.InsertOne(testCtx(t), bson.M{"_id": "ns|wf|7b", "namespace_id": "ns", "workflow_id": "wf", "archetype_id": 7})
+	require.Error(t, err, "the new index still rejects a second row of the same archetype")
 }
 
 // A unique index over duplicate data is not created: the failure is logged
@@ -535,7 +586,11 @@ func TestIndexMigration_FactoryRunsMigrationsInBackground(t *testing.T) {
 	_, err = factory.NewVisibilityStore(config.CustomDatastoreConfig{}, nil, nil, nil, nil, nil, log.NewNoopLogger(), metrics.NoopMetricsHandler)
 	require.NoError(t, err)
 
-	ids := []string{mongodb.PrimaryIndexMigrationForTest().ID, mongodb.VisibilityIndexMigrationForTest().ID}
+	ids := []string{
+		mongodb.PrimaryIndexMigrationForTest().ID,
+		mongodb.PrimaryIndexMigrationArchetypeForTest().ID,
+		mongodb.VisibilityIndexMigrationForTest().ID,
+	}
 	require.Eventually(t, func() bool {
 		for _, id := range ids {
 			var doc mongodb.IndexMigrationDocumentForTest
@@ -549,6 +604,7 @@ func TestIndexMigration_FactoryRunsMigrationsInBackground(t *testing.T) {
 	}, 60*time.Second, 100*time.Millisecond, "the background migrations did not complete")
 
 	require.Contains(t, env.indexes(t, "history_nodes"), "history_nodes_branch_node_txn")
+	require.Contains(t, env.indexes(t, "current_executions"), "current_executions_namespace_workflow_archetype")
 	require.Contains(t, env.indexes(t, "visibility_executions"), "visibility_status_time")
 
 	factory.Close()
@@ -564,6 +620,7 @@ func TestIndexMigration_InitScriptListsMigrationIndexes(t *testing.T) {
 
 	for _, migration := range []mongodb.IndexMigrationForTest{
 		mongodb.PrimaryIndexMigrationForTest(),
+		mongodb.PrimaryIndexMigrationArchetypeForTest(),
 		mongodb.VisibilityIndexMigrationForTest(),
 	} {
 		require.Containsf(t, content, migration.ID, "init.js does not mention migration %s", migration.ID)
@@ -583,6 +640,7 @@ func TestIndexMigration_PrebuiltIndexesAreNotRebuilt(t *testing.T) {
 
 	migrations := []mongodb.IndexMigrationForTest{
 		mongodb.PrimaryIndexMigrationForTest(),
+		mongodb.PrimaryIndexMigrationArchetypeForTest(),
 		mongodb.VisibilityIndexMigrationForTest(),
 	}
 	for _, migration := range migrations {
@@ -626,6 +684,7 @@ func TestIndexMigration_FactoryRunIndexMigrations(t *testing.T) {
 
 	for _, migration := range []mongodb.IndexMigrationForTest{
 		mongodb.PrimaryIndexMigrationForTest(),
+		mongodb.PrimaryIndexMigrationArchetypeForTest(),
 		mongodb.VisibilityIndexMigrationForTest(),
 	} {
 		require.Equal(t, "completed", env.record(t, migration.ID).Status)

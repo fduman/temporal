@@ -43,6 +43,10 @@ func PrimaryIndexMigrationForTest() IndexMigrationForTest {
 	return primaryIndexMigration()
 }
 
+func PrimaryIndexMigrationArchetypeForTest() IndexMigrationForTest {
+	return primaryIndexMigrationArchetype()
+}
+
 func VisibilityIndexMigrationForTest() IndexMigrationForTest {
 	return visibilityIndexMigration()
 }

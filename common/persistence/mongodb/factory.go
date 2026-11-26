@@ -85,7 +85,7 @@ func NewFactory(
 // factory. It never blocks or fails the caller: the outcome is logged and
 // recorded in the schema_migrations collection. When index migrations are
 // disabled in the config it only reports the missing indexes.
-func (f *Factory) startIndexMigration(once *sync.Once, migration indexMigration) {
+func (f *Factory) startIndexMigration(once *sync.Once, migrations ...indexMigration) {
 	if f.migrationCtx == nil {
 		return
 	}
@@ -94,11 +94,17 @@ func (f *Factory) startIndexMigration(once *sync.Once, migration indexMigration)
 		go func() {
 			defer f.migrationWG.Done()
 			migrator := newIndexMigrator(f.database, f.logger)
-			if f.cfg.DisableIndexMigration {
-				migrator.report(f.migrationCtx, migration)
-				return
+			// The migrations run one after the other, in order.
+			for _, migration := range migrations {
+				if f.migrationCtx.Err() != nil {
+					return
+				}
+				if f.cfg.DisableIndexMigration {
+					migrator.report(f.migrationCtx, migration)
+					continue
+				}
+				migrator.run(f.migrationCtx, migration)
 			}
-			migrator.run(f.migrationCtx, migration)
 		}()
 	})
 }
@@ -227,7 +233,7 @@ func (f *Factory) buildConnectionString() string {
 // is used, and it expects the primary and the visibility collections in the
 // database of this factory.
 func (f *Factory) RunIndexMigrations(ctx context.Context) error {
-	for _, migration := range []indexMigration{primaryIndexMigration(), visibilityIndexMigration()} {
+	for _, migration := range append(primaryIndexMigrations(), visibilityIndexMigration()) {
 		outcome := newIndexMigrator(f.database, f.logger).run(ctx, migration)
 		switch outcome {
 		case indexMigrationCompleted, indexMigrationAlreadyCompleted:
@@ -374,7 +380,7 @@ func (f *Factory) NewExecutionStore() (p.ExecutionStore, error) {
 	}
 
 	f.executionStore = executionStore
-	f.startIndexMigration(&f.primaryMigrationOnce, primaryIndexMigration())
+	f.startIndexMigration(&f.primaryMigrationOnce, primaryIndexMigrations()...)
 	return executionStore, nil
 }
 

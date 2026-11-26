@@ -180,7 +180,7 @@ type (
 		NamespaceID      string     `bson:"namespace_id"`
 		WorkflowID       string     `bson:"workflow_id"`
 		RunID            string     `bson:"run_id"`
-		ArchetypeID      uint32     `bson:"archetype_id"`
+		ArchetypeID      uint32     `bson:"archetype_id,omitempty"`
 		CreateRequestID  string     `bson:"create_request_id,omitempty"`
 		State            int32      `bson:"state"`
 		Status           int32      `bson:"status"`
@@ -270,6 +270,26 @@ func (s *executionStore) ensureIndexes(ctx context.Context) error {
 
 func executionDocID(namespaceID, workflowID, runID string) string {
 	return fmt.Sprintf("%s|%s|%s", namespaceID, workflowID, runID)
+}
+
+// storedArchetypeID is the archetype_id value of a current execution document:
+// zero (left out) for workflows, the archetype for other CHASM executions.
+// Workflow rows thereby look like rows written before archetypes existed, the
+// way SQL keeps workflows in current_executions without an archetype column.
+func storedArchetypeID(archetypeID chasm.ArchetypeID) uint32 {
+	if archetypeID == chasm.UnspecifiedArchetypeID || archetypeID == chasm.WorkflowArchetypeID {
+		return 0
+	}
+	return archetypeID
+}
+
+// archetype returns the archetype of the current execution; a document without
+// archetype_id is a workflow.
+func (d *currentExecutionDocument) archetype() chasm.ArchetypeID {
+	if d.ArchetypeID == 0 {
+		return chasm.WorkflowArchetypeID
+	}
+	return d.ArchetypeID
 }
 
 func currentExecutionDocID(namespaceID, workflowID string, archetypeID chasm.ArchetypeID) string {
@@ -1465,7 +1485,7 @@ func (s *executionStore) buildCurrentExecutionDocument(request *persistence.Inte
 		NamespaceID:      snapshot.NamespaceID,
 		WorkflowID:       snapshot.WorkflowID,
 		RunID:            state.GetRunId(),
-		ArchetypeID:      request.ArchetypeID,
+		ArchetypeID:      storedArchetypeID(request.ArchetypeID),
 		CreateRequestID:  state.GetCreateRequestId(),
 		State:            int32(state.GetState()),
 		Status:           int32(state.GetStatus()),
@@ -1517,7 +1537,7 @@ func (s *executionStore) insertNewCurrentExecution(
 		return &currentExecutionWriteConflictError{
 			namespaceID: doc.NamespaceID,
 			workflowID:  doc.WorkflowID,
-			archetypeID: chasm.ArchetypeID(doc.ArchetypeID),
+			archetypeID: doc.archetype(),
 			message:     message,
 		}
 	}
@@ -1563,7 +1583,7 @@ func (s *executionStore) updateExistingCurrentExecution(
 		return serviceerror.NewUnavailablef("failed to update current execution document: %v", err)
 	}
 	if result.MatchedCount == 0 {
-		existing, loadErr := s.loadCurrentExecution(ctx, doc.NamespaceID, doc.WorkflowID, chasm.ArchetypeID(doc.ArchetypeID))
+		existing, loadErr := s.loadCurrentExecution(ctx, doc.NamespaceID, doc.WorkflowID, doc.archetype())
 		if loadErr != nil {
 			return loadErr
 		}
@@ -1581,7 +1601,7 @@ func (s *executionStore) ensureRunIDMismatch(
 	if doc == nil {
 		return nil
 	}
-	current, err := s.loadCurrentExecution(ctx, doc.NamespaceID, doc.WorkflowID, chasm.ArchetypeID(doc.ArchetypeID))
+	current, err := s.loadCurrentExecution(ctx, doc.NamespaceID, doc.WorkflowID, doc.archetype())
 	if err != nil {
 		return err
 	}
@@ -1710,17 +1730,6 @@ func (s *executionStore) ensureCurrentExecutionIndexes(ctx context.Context) erro
 		model mongo.IndexModel
 	}{
 		{
-			name: "current_executions_namespace_workflow",
-			model: mongo.IndexModel{
-				Keys: bson.D{
-					{Key: "namespace_id", Value: 1},
-					{Key: "workflow_id", Value: 1},
-					{Key: "archetype_id", Value: 1},
-				},
-				Options: options.Index().SetName("current_executions_namespace_workflow_archetype").SetUnique(true),
-			},
-		},
-		{
 			name: "current_executions_shard",
 			model: mongo.IndexModel{
 				Keys: bson.D{
@@ -1733,8 +1742,12 @@ func (s *executionStore) ensureCurrentExecutionIndexes(ctx context.Context) erro
 		},
 	}
 
-	// Drop legacy index that didn't include archetype_id, if it exists.
-	_ = idxView.DropOne(ctx, "current_executions_namespace_workflow")
+	// The unique (namespace_id, workflow_id, archetype_id) index is built by the
+	// primary-indexes-002 migration, which also drops the older unique
+	// (namespace_id, workflow_id) index once the new one exists. It is not built
+	// here because current_executions is populated on existing installations.
+	// Uniqueness does not depend on it in the meantime: _id is derived from the
+	// same fields (currentExecutionDocID).
 
 	for _, spec := range indexes {
 		if _, err := idxView.CreateOne(ctx, spec.model); err != nil && !isDuplicateIndexError(err) {

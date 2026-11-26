@@ -134,6 +134,11 @@ type (
 		// dropped once this index exists. An index named here is only dropped
 		// when its keys are identical to Keys.
 		Replaces []string
+		// Supersedes lists the names of older indexes whose keys are a strict
+		// prefix of Keys and that this index takes over from, for example a
+		// unique index that gains a field. Such an index is dropped once this
+		// index exists, and only while its keys are still that prefix.
+		Supersedes []string
 		// MinServerVersion is the lowest MongoDB version (major, minor) that
 		// supports the index. On an older server the index is skipped.
 		MinServerVersion []int
@@ -262,6 +267,41 @@ func primaryIndexMigration() indexMigration {
 			},
 		},
 	}
+}
+
+// primaryIndexMigrationArchetype moves the uniqueness of current executions
+// from (namespace_id, workflow_id) to (namespace_id, workflow_id, archetype_id).
+// Since v1.31 a CHASM execution (standalone activity, scheduler, ...) may share
+// its business ID with a workflow, which the old unique index rejects.
+//
+// Workflow rows do not store archetype_id (see currentExecutionDocument), the
+// same way SQL keeps them in current_executions and only CHASM rows carry an
+// archetype in current_chasm_executions. They are therefore indexed as null and
+// need no backfill. The old index is dropped only after the new one exists, so
+// the collection is never without a unique index on these fields.
+func primaryIndexMigrationArchetype() indexMigration {
+	return indexMigration{
+		ID: "primary-indexes-002",
+		Indexes: []indexDefinition{
+			{
+				Collection: collectionCurrentExecutions,
+				Name:       "current_executions_namespace_workflow_archetype",
+				Keys: bson.D{
+					{Key: "namespace_id", Value: 1},
+					{Key: "workflow_id", Value: 1},
+					{Key: "archetype_id", Value: 1},
+				},
+				Unique:     true,
+				Supersedes: []string{"current_executions_namespace_workflow"},
+			},
+		},
+	}
+}
+
+// primaryIndexMigrations are the migrations of the primary database, in the
+// order they have to run.
+func primaryIndexMigrations() []indexMigration {
+	return []indexMigration{primaryIndexMigration(), primaryIndexMigrationArchetype()}
 }
 
 // visibilityIndexMigration adds indexes for filtered visibility queries. Every
@@ -732,6 +772,27 @@ func (m *indexMigrator) ensureIndexOnce(ctx context.Context, def indexDefinition
 		result.Dropped = append(result.Dropped, oldName)
 	}
 
+	// The index is in place: drop the narrower indexes it takes over from.
+	for _, oldName := range def.Supersedes {
+		if oldName == result.CreatedAs {
+			continue
+		}
+		old := findIndexByName(existing, oldName)
+		if old == nil {
+			continue
+		}
+		if !strictIndexKeyPrefix(old.Key, def.Keys) {
+			result.Notes = append(result.Notes, fmt.Sprintf(
+				"index %q was not dropped: its keys are not a prefix of the index superseding it", oldName))
+			continue
+		}
+		if err := col.Indexes().DropOne(ctx, oldName); err != nil {
+			result.Notes = append(result.Notes, fmt.Sprintf("index %q could not be dropped: %v", oldName, err))
+			continue
+		}
+		result.Dropped = append(result.Dropped, oldName)
+	}
+
 	return result, nil
 }
 
@@ -917,6 +978,14 @@ func findEquivalentIndex(indexes []existingIndex, def indexDefinition) *existing
 		}
 	}
 	return nil
+}
+
+// strictIndexKeyPrefix reports whether prefix is a shorter leading part of keys.
+func strictIndexKeyPrefix(prefix, keys bson.D) bool {
+	if len(prefix) == 0 || len(prefix) >= len(keys) {
+		return false
+	}
+	return sameIndexKeys(prefix, keys[:len(prefix)])
 }
 
 func sameIndexKeys(a, b bson.D) bool {
