@@ -11,8 +11,8 @@ persistence:
     visibilityStore: visibility
 
     {{- $db := env "DB" -}}
-    {{- if not (eq $db "cassandra" "mysql8" "postgres12" "postgres12_pgx") -}}
-      {{- fail "Invalid DB value. Supported values are cassandra, mysql8, postgres12, postgres12_pgx" -}}
+    {{- if not (eq $db "cassandra" "mysql8" "postgres12" "postgres12_pgx" "mongodb") -}}
+      {{- fail "Invalid DB value. Supported values are cassandra, mysql8, postgres12, postgres12_pgx, mongodb" -}}
     {{- end }}
 
     datastores:
@@ -88,6 +88,20 @@ persistence:
                     keyFile: {{ env "SQL_CERT_KEY" }}
                     enableHostVerification: {{ default "false" (env "SQL_HOST_VERIFICATION") }}
                     serverName: {{ env "SQL_HOST_NAME" }}
+        {{- else if eq $db "mongodb" }}
+            customDataStoreConfig:
+                name: mongodb
+                indexName: temporal
+                options:
+                    type: persistence
+            mongodb:
+                hosts: ["{{ env "MONGODB_SEEDS" }}"]
+                user: {{ env "MONGODB_USER" | quote }}
+                password: {{ env "MONGODB_PASSWORD" | quote }}
+                authSource: admin
+                databaseName: {{ default "temporal" (env "MONGODB_DATABASE") | quote }}
+                replicaSet: {{ default "rs0" (env "MONGODB_REPLICA_SET") | quote }}
+                maxConns: {{ default "20" (env "MONGODB_MAX_CONNS") }}
         {{- end }}
 
         visibility:
@@ -152,6 +166,20 @@ persistence:
                     keyFile: {{ env "SQL_CERT_KEY" }}
                     enableHostVerification: {{ default "false" (env "SQL_HOST_VERIFICATION") }}
                     serverName: {{ env "SQL_HOST_NAME" }}
+            {{- else if eq $db "mongodb" }}
+            customDataStoreConfig:
+                name: mongodb
+                indexName: temporal_visibility
+                options:
+                    type: visibility
+            mongodb:
+                hosts: ["{{ env "MONGODB_SEEDS" }}"]
+                user: {{ env "MONGODB_USER" | quote }}
+                password: {{ env "MONGODB_PASSWORD" | quote }}
+                authSource: admin
+                databaseName: {{ default "temporal_visibility" (env "MONGODB_DATABASE") | quote }}
+                replicaSet: {{ default "rs0" (env "MONGODB_REPLICA_SET") | quote }}
+                maxConns: {{ default "10" (env "MONGODB_VIS_MAX_CONNS") }}
             {{- else -}}
               {{- fail "No visibility configured. Cassandra is no longer supported for visibility." -}}
             {{- end }}

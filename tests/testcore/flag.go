@@ -18,13 +18,17 @@ var cliFlags struct {
 
 func init() {
 	flag.StringVar(&cliFlags.persistenceType, "persistenceType", "sql", "type of persistence - [nosql or sql]")
-	flag.StringVar(&cliFlags.persistenceDriver, "persistenceDriver", "sqlite", "driver of nosql/sql - [cassandra, mysql8, postgres12, sqlite]")
+	flag.StringVar(&cliFlags.persistenceDriver, "persistenceDriver", "sqlite", "driver of nosql/sql - [cassandra, mongodb, mysql8, postgres12, sqlite]")
 	flag.StringVar(&cliFlags.enableFaultInjection, "enableFaultInjection", "", "enable global fault injection")
 }
 
 func UseSQLVisibility() bool {
 	switch cliFlags.persistenceDriver {
 	case mysql.PluginName, postgresql.PluginName, postgresql.PluginNamePGX, sqlite.PluginName:
+		return true
+	// MongoDB serves visibility itself and uses the same alias-based search
+	// attribute handling as SQL, so it takes the non-Elasticsearch paths.
+	case mongoDBDriverName:
 		return true
 	// If the main storage is Cassandra, Elasticsearch is used for visibility.
 	default:
@@ -35,3 +39,13 @@ func UseSQLVisibility() bool {
 func UseCassandraPersistence() bool {
 	return cliFlags.persistenceType == config.StoreTypeNoSQL && cliFlags.persistenceDriver == "cassandra"
 }
+
+func UseMongoPersistence() bool {
+	return cliFlags.persistenceType == config.StoreTypeNoSQL && cliFlags.persistenceDriver == mongoDBDriverName
+}
+
+func UseMongoDBVisibility() bool {
+	return UseMongoPersistence()
+}
+
+const mongoDBDriverName = "mongodb"

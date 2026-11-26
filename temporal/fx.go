@@ -111,6 +111,7 @@ type (
 		ServiceResolver                 resolver.ServiceResolver
 		CustomDataStoreFactory          persistenceClient.AbstractDataStoreFactory
 		CustomVisibilityStore           visibility.VisibilityStoreFactory
+		CustomVisibilityStoreForGraph   visibility.VisibilityStoreFactory `name:"customVisibilityStore" optional:"true"`
 		CustomHistoryArchiverFactory    provider.CustomHistoryArchiverFactory
 		CustomVisibilityArchiverFactory provider.CustomVisibilityArchiverFactory
 
@@ -136,6 +137,13 @@ type (
 	}
 )
 
+type visibilityStoreFactoryOut struct {
+	fx.Out
+
+	Default  visibility.VisibilityStoreFactory `name:"defaultVisibilityStore" optional:"true"`
+	Fallback visibility.VisibilityStoreFactory `name:"customVisibilityStoreFallback" optional:"true"`
+}
+
 var (
 	TopLevelModule = fx.Options(
 		fx.Provide(
@@ -143,12 +151,28 @@ var (
 			ServerOptionsProvider,
 			resource.ArchivalMetadataProvider,
 			TaskCategoryRegistryProvider,
+			visibilityStoreFactoryProvider,
 			HistoryServiceProvider,
 			MatchingServiceProvider,
 			FrontendServiceProvider,
 			InternalFrontendServiceProvider,
 			WorkerServiceProvider,
 			ApplyClusterMetadataConfigProvider,
+		),
+		fx.Decorate(
+			fx.Annotate(
+				func(
+					custom visibility.VisibilityStoreFactory,
+					fallback visibility.VisibilityStoreFactory,
+				) visibility.VisibilityStoreFactory {
+					if custom != nil {
+						return custom
+					}
+					return fallback
+				},
+				fx.ParamTags(`name:"customVisibilityStore" optional:"true"`, `name:"customVisibilityStoreFallback" optional:"true"`),
+				fx.ResultTags(`name:"customVisibilityStore"`),
+			),
 		),
 		dynamicconfig.Module,
 		pprof.Module,
@@ -323,6 +347,7 @@ func ServerOptionsProvider(opts []ServerOption) (serverOptionsProvider, error) {
 		ServiceResolver:                 so.persistenceServiceResolver,
 		CustomDataStoreFactory:          so.customDataStoreFactory,
 		CustomVisibilityStore:           so.customVisibilityStoreFactory,
+		CustomVisibilityStoreForGraph:   so.customVisibilityStoreFactory,
 		CustomHistoryArchiverFactory:    so.customHistoryArchiverFactory,
 		CustomVisibilityArchiverFactory: so.customVisibilityArchiverFactory,
 
@@ -404,7 +429,8 @@ type (
 		ClaimMapper                     authorization.ClaimMapper
 		TokenProvider                   auth.TokenProvider
 		DataStoreFactory                persistenceClient.AbstractDataStoreFactory
-		VisibilityStoreFactory          visibility.VisibilityStoreFactory
+		VisibilityStoreFactory          visibility.VisibilityStoreFactory `name:"customVisibilityStore" optional:"true"`
+		DefaultVisibilityStoreFactory   visibility.VisibilityStoreFactory `name:"defaultVisibilityStore" optional:"true"`
 		CustomHistoryArchiverFactory    provider.CustomHistoryArchiverFactory
 		CustomVisibilityArchiverFactory provider.CustomVisibilityArchiverFactory
 		SpanExporters                   []otelsdktrace.SpanExporter
@@ -443,7 +469,10 @@ func (params ServiceProviderParamsCommon) GetCommonServiceOptions(serviceName pr
 				return params.DataStoreFactory
 			},
 			func() visibility.VisibilityStoreFactory {
-				return params.VisibilityStoreFactory
+				if params.VisibilityStoreFactory != nil {
+					return params.VisibilityStoreFactory
+				}
+				return params.DefaultVisibilityStoreFactory
 			},
 			func() provider.CustomHistoryArchiverFactory {
 				return params.CustomHistoryArchiverFactory
@@ -522,6 +551,19 @@ func TaskCategoryRegistryProvider(archivalMetadata archiver.ArchivalMetadata) ta
 		registry.AddCategory(tasks.CategoryArchival)
 	}
 	return registry
+}
+
+func visibilityStoreFactoryProvider(
+	dataStoreFactory persistence.DataStoreFactory,
+) visibilityStoreFactoryOut {
+	factory, ok := dataStoreFactory.(visibility.VisibilityStoreFactory)
+	if !ok || factory == nil {
+		return visibilityStoreFactoryOut{}
+	}
+	return visibilityStoreFactoryOut{
+		Default:  factory,
+		Fallback: factory,
+	}
 }
 
 func NewService(app *fx.App, serviceName primitives.ServiceName, logger log.Logger) ServicesGroupOut {
