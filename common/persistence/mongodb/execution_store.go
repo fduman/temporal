@@ -136,35 +136,35 @@ type (
 	}
 
 	executionDocument struct {
-		ID                   string           `bson:"_id"`
-		ShardID              int32            `bson:"shard_id"`
-		NamespaceID          string           `bson:"namespace_id"`
-		WorkflowID           string           `bson:"workflow_id"`
-		RunID                string           `bson:"run_id"`
-		NextEventID          int64            `bson:"next_event_id"`
-		DBRecordVersion      int64            `bson:"db_record_version"`
-		LastWriteVersion     int64            `bson:"last_write_version"`
-		StartVersion         int64            `bson:"start_version"`
-		State                int32            `bson:"state"`
-		Status               int32            `bson:"status"`
-		Condition            int64            `bson:"condition"`
-		StateTransitionCount int64            `bson:"state_transition_count,omitempty"`
-		CreateRequestID      string           `bson:"create_request_id,omitempty"`
-		UpdateTime           time.Time        `bson:"update_time"`
-		StartTime            *time.Time       `bson:"start_time,omitempty"`
-		ExecutionTime        *time.Time       `bson:"execution_time,omitempty"`
-		VisibilityTime       *time.Time       `bson:"visibility_time,omitempty"`
-		ExecutionInfo        *dataBlobDoc     `bson:"execution_info"`
-		ExecutionState       *dataBlobDoc     `bson:"execution_state"`
-		ActivityInfos        []int64BlobDoc   `bson:"activity_infos,omitempty"`
-		TimerInfos           []stringBlobDoc  `bson:"timer_infos,omitempty"`
-		ChildExecutionInfos  []int64BlobDoc   `bson:"child_execution_infos,omitempty"`
-		RequestCancelInfos   []int64BlobDoc   `bson:"request_cancel_infos,omitempty"`
-		SignalInfos          []int64BlobDoc   `bson:"signal_infos,omitempty"`
-		SignalRequestedIDs   []string         `bson:"signal_requested_ids,omitempty"`
-		ChasmNodes           []chasmNodeDoc   `bson:"chasm_nodes,omitempty"`
-		BufferedEvents       bufferedBatches  `bson:"buffered_events,omitempty"`
-		Checksum             *dataBlobDoc     `bson:"checksum,omitempty"`
+		ID                   string          `bson:"_id"`
+		ShardID              int32           `bson:"shard_id"`
+		NamespaceID          string          `bson:"namespace_id"`
+		WorkflowID           string          `bson:"workflow_id"`
+		RunID                string          `bson:"run_id"`
+		NextEventID          int64           `bson:"next_event_id"`
+		DBRecordVersion      int64           `bson:"db_record_version"`
+		LastWriteVersion     int64           `bson:"last_write_version"`
+		StartVersion         int64           `bson:"start_version"`
+		State                int32           `bson:"state"`
+		Status               int32           `bson:"status"`
+		Condition            int64           `bson:"condition"`
+		StateTransitionCount int64           `bson:"state_transition_count,omitempty"`
+		CreateRequestID      string          `bson:"create_request_id,omitempty"`
+		UpdateTime           time.Time       `bson:"update_time"`
+		StartTime            *time.Time      `bson:"start_time,omitempty"`
+		ExecutionTime        *time.Time      `bson:"execution_time,omitempty"`
+		VisibilityTime       *time.Time      `bson:"visibility_time,omitempty"`
+		ExecutionInfo        *dataBlobDoc    `bson:"execution_info"`
+		ExecutionState       *dataBlobDoc    `bson:"execution_state"`
+		ActivityInfos        []int64BlobDoc  `bson:"activity_infos,omitempty"`
+		TimerInfos           []stringBlobDoc `bson:"timer_infos,omitempty"`
+		ChildExecutionInfos  []int64BlobDoc  `bson:"child_execution_infos,omitempty"`
+		RequestCancelInfos   []int64BlobDoc  `bson:"request_cancel_infos,omitempty"`
+		SignalInfos          []int64BlobDoc  `bson:"signal_infos,omitempty"`
+		SignalRequestedIDs   []string        `bson:"signal_requested_ids,omitempty"`
+		ChasmNodes           []chasmNodeDoc  `bson:"chasm_nodes,omitempty"`
+		BufferedEvents       bufferedBatches `bson:"buffered_events,omitempty"`
+		Checksum             *dataBlobDoc    `bson:"checksum,omitempty"`
 	}
 
 	currentExecutionDocument struct {
