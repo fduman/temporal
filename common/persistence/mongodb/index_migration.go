@@ -298,7 +298,7 @@ func primaryIndexMigrationArchetype() indexMigration {
 					{Key: "workflow_id", Value: 1},
 					{Key: "archetype_id", Value: 1},
 				},
-				Unique:     true,
+				Unique: true,
 			},
 		},
 	}
