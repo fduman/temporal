@@ -2,6 +2,7 @@ package mongodb_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"testing"
@@ -9,7 +10,12 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/persistence"
@@ -667,4 +673,201 @@ func (s *TaskStoreSuite) TestBuildIDAddedAgain() {
 	count, err := s.store.CountTaskQueuesByBuildId(s.ctx, &persistence.CountTaskQueuesByBuildIdRequest{NamespaceID: ns, BuildID: buildID})
 	s.Require().NoError(err)
 	s.Require().Equal(1, count)
+}
+
+// Classic and fair tasks of a queue share the tasks collection. A fair
+// delete must not remove classic (pass 0) tasks, and a classic delete must
+// not remove fair ones.
+func (s *TaskStoreSuite) TestFairAndClassicTasksDoNotDeleteEachOther() {
+	const (
+		ns    = "ns-fair-classic-mixed"
+		queue = "queue-fair-classic-mixed"
+	)
+	fairStore, err := s.factory.NewFairTaskStore()
+	s.Require().NoError(err)
+	info := persistence.NewDataBlob([]byte("queue-info"), enumspb.ENCODING_TYPE_PROTO3.String())
+	blob := func(v string) *commonpb.DataBlob {
+		return persistence.NewDataBlob([]byte(v), enumspb.ENCODING_TYPE_PROTO3.String())
+	}
+	for _, store := range []persistence.TaskStore{s.store, fairStore} {
+		s.Require().NoError(store.CreateTaskQueue(s.ctx, &persistence.InternalCreateTaskQueueRequest{
+			NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, RangeID: 1, TaskQueueInfo: info,
+		}))
+	}
+
+	var classicTasks []*persistence.InternalCreateTask
+	for id := int64(1); id <= 3; id++ {
+		classicTasks = append(classicTasks, &persistence.InternalCreateTask{TaskId: id, Task: blob("classic"), Subqueue: persistence.SubqueueZero})
+	}
+	_, err = s.store.CreateTasks(s.ctx, &persistence.InternalCreateTasksRequest{
+		NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, RangeID: 1, Tasks: classicTasks,
+	})
+	s.Require().NoError(err)
+	_, err = fairStore.CreateTasks(s.ctx, &persistence.InternalCreateTasksRequest{
+		NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, RangeID: 1,
+		Tasks: []*persistence.InternalCreateTask{
+			{TaskPass: 1, TaskId: 10, Task: blob("fair"), Subqueue: persistence.SubqueueZero},
+			{TaskPass: 1, TaskId: 11, Task: blob("fair"), Subqueue: persistence.SubqueueZero},
+		},
+	})
+	s.Require().NoError(err)
+
+	countClassic := func() int {
+		resp, err := s.store.GetTasks(s.ctx, &persistence.GetTasksRequest{
+			NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+			ExclusiveMaxTaskID: math.MaxInt64, Subqueue: persistence.SubqueueZero, PageSize: 100, UseLimit: true,
+		})
+		s.Require().NoError(err)
+		return len(resp.Tasks)
+	}
+	fairTasks := func() []*commonpb.DataBlob {
+		resp, err := fairStore.GetTasks(s.ctx, &persistence.GetTasksRequest{
+			NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, InclusiveMinPass: 1,
+			ExclusiveMaxTaskID: math.MaxInt64, Subqueue: persistence.SubqueueZero, PageSize: 100, UseLimit: true,
+		})
+		s.Require().NoError(err)
+		return resp.Tasks
+	}
+	fairComplete := func(limit int, conditionRangeID int64) int {
+		n, err := fairStore.CompleteTasksLessThan(s.ctx, &persistence.CompleteTasksLessThanRequest{
+			NamespaceID: ns, TaskQueueName: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, Subqueue: persistence.SubqueueZero,
+			ExclusiveMaxPass: 2, ExclusiveMaxTaskID: math.MaxInt64, Limit: limit, ConditionRangeID: conditionRangeID,
+		})
+		s.Require().NoError(err)
+		return n
+	}
+
+	// A fair read returns only fair tasks.
+	s.Require().Len(fairTasks(), 2)
+	for _, task := range fairTasks() {
+		s.Require().Equal("fair", string(task.Data))
+	}
+
+	// With a limit, the lowest (pass, id) goes first: a pass-0 task would be
+	// picked before any fair task if the filter had no lower bound.
+	s.Require().Equal(1, fairComplete(1, 0))
+	s.Require().Equal(3, countClassic())
+	s.Require().Len(fairTasks(), 1)
+
+	// A classic delete leaves the fair task.
+	n, err := s.store.CompleteTasksLessThan(s.ctx, &persistence.CompleteTasksLessThanRequest{
+		NamespaceID: ns, TaskQueueName: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, Subqueue: persistence.SubqueueZero,
+		ExclusiveMaxTaskID: math.MaxInt64,
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(3, n)
+	s.Require().Len(fairTasks(), 1)
+
+	// The fenced path has the same bound.
+	_, err = s.store.CreateTasks(s.ctx, &persistence.InternalCreateTasksRequest{
+		NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, RangeID: 1, Tasks: classicTasks,
+	})
+	s.Require().NoError(err)
+	s.Require().Equal(1, fairComplete(0, 1))
+	s.Require().Equal(3, countClassic())
+	s.Require().Empty(fairTasks())
+}
+
+// A fair store rejects requests for pass 0, like sql/task_v2.go.
+func (s *TaskStoreSuite) TestFairStoreRejectsPassZero() {
+	fairStore, err := s.factory.NewFairTaskStore()
+	s.Require().NoError(err)
+
+	_, err = fairStore.GetTasks(s.ctx, &persistence.GetTasksRequest{
+		NamespaceID: "ns-fair-pass0", TaskQueue: "queue-fair-pass0", TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		ExclusiveMaxTaskID: math.MaxInt64, Subqueue: persistence.SubqueueZero, PageSize: 10,
+	})
+	var internal *serviceerror.Internal
+	s.Require().ErrorAs(err, &internal)
+
+	_, err = fairStore.CompleteTasksLessThan(s.ctx, &persistence.CompleteTasksLessThanRequest{
+		NamespaceID: "ns-fair-pass0", TaskQueueName: "queue-fair-pass0", TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		Subqueue: persistence.SubqueueZero, ExclusiveMaxTaskID: math.MaxInt64,
+	})
+	s.Require().ErrorAs(err, &internal)
+}
+
+// CreateTasks with UpdateMetadata and unchanged metadata must still take part
+// in the range_id fence: while another transaction holds a range_id change,
+// CreateTasks must not write its tasks. It fails with a condition failure if
+// that change commits before CreateTasks gives up retrying the write
+// conflict, and with ResourceExhausted otherwise.
+func (s *TaskStoreSuite) TestCreateTasksUpdateMetadataFencesRange() {
+	const (
+		ns    = "ns-tasks-fence-metadata"
+		queue = "queue-tasks-fence-metadata"
+	)
+	info := persistence.NewDataBlob([]byte("queue-info"), enumspb.ENCODING_TYPE_PROTO3.String())
+	s.Require().NoError(s.store.CreateTaskQueue(s.ctx, &persistence.InternalCreateTaskQueueRequest{
+		NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, RangeID: 7, TaskQueueInfo: info,
+	}))
+	createTask := func(id int64) error {
+		_, err := s.store.CreateTasks(s.ctx, &persistence.InternalCreateTasksRequest{
+			NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, RangeID: 7,
+			UpdateMetadata: true, TaskQueueInfo: info,
+			Tasks: []*persistence.InternalCreateTask{{
+				TaskId: id, Task: persistence.NewDataBlob([]byte("task"), enumspb.ENCODING_TYPE_PROTO3.String()), Subqueue: persistence.SubqueueZero,
+			}},
+		})
+		return err
+	}
+
+	db := rawTestDatabase(s.T(), s.dbName)
+	queues := db.Collection("task_queues")
+	queueID := fmt.Sprintf("%s|%s|%d|%d|v1", ns, queue, enumspb.TASK_QUEUE_TYPE_WORKFLOW, persistence.SubqueueZero)
+	fence := func() int64 {
+		var doc struct {
+			RangeFence int64 `bson:"range_fence"`
+		}
+		s.Require().NoError(queues.FindOne(s.ctx, bson.M{"_id": queueID}).Decode(&doc))
+		return doc.RangeFence
+	}
+
+	// The fence write changes the document even when the metadata does not.
+	before := fence()
+	s.Require().NoError(createTask(1))
+	s.Require().Greater(fence(), before)
+
+	// A range_id change held open in another transaction, committed while
+	// CreateTasks waits on it.
+	sess, err := db.Client().StartSession()
+	s.Require().NoError(err)
+	defer sess.EndSession(context.Background())
+	s.Require().NoError(sess.StartTransaction())
+	_, err = queues.UpdateOne(mongo.NewSessionContext(s.ctx, sess), bson.M{"_id": queueID}, bson.M{"$set": bson.M{"range_id": int64(8)}})
+	s.Require().NoError(err)
+	committed := make(chan error, 1)
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		committed <- sess.CommitTransaction(context.Background())
+	}()
+
+	err = createTask(2)
+	s.Require().NoError(<-committed)
+	var cfe *persistence.ConditionFailedError
+	var exhausted *serviceerror.ResourceExhausted
+	s.Require().True(errors.As(err, &cfe) || errors.As(err, &exhausted), "unexpected error: %v", err)
+
+	n, err := db.Collection("tasks").CountDocuments(s.ctx, bson.M{"namespace_id": ns, "task_queue": queue})
+	s.Require().NoError(err)
+	s.Require().Equal(int64(1), n)
+}
+
+// rawTestDatabase connects to the test database with the driver directly, to
+// set up states the store API cannot produce.
+func rawTestDatabase(t *testing.T, dbName string) *mongo.Database {
+	cfg := newMongoTestConfig(dbName)
+	opts := options.Client().SetHosts(cfg.Hosts)
+	if cfg.ReplicaSet != "" {
+		opts.SetReplicaSet(cfg.ReplicaSet)
+	}
+	if cfg.User != "" {
+		opts.SetAuth(options.Credential{Username: cfg.User, Password: cfg.Password, AuthSource: cfg.AuthSource})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := mongo.Connect(ctx, opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Disconnect(context.Background()) })
+	return c.Database(dbName)
 }
