@@ -562,11 +562,17 @@ func (s *taskStore) CreateTasks(
 			if request.TaskQueueInfo == nil {
 				return nil, serviceerror.NewInternal("CreateTasks: UpdateMetadata set without TaskQueueInfo")
 			}
-			queueUpdate = bson.M{"$set": bson.M{
-				"data":          request.TaskQueueInfo.Data,
-				"data_encoding": request.TaskQueueInfo.EncodingType.String(),
-				"updated_at":    time.Now().UTC(),
-			}}
+			// The $inc keeps the fence effective when the metadata is
+			// unchanged: a $set to the same values is a no-op that does not
+			// conflict with a concurrent range_id change.
+			queueUpdate = bson.M{
+				"$set": bson.M{
+					"data":          request.TaskQueueInfo.Data,
+					"data_encoding": request.TaskQueueInfo.EncodingType.String(),
+					"updated_at":    time.Now().UTC(),
+				},
+				"$inc": rangeFenceUpdate()["$inc"],
+			}
 		} else {
 			queueUpdate = rangeFenceUpdate()
 		}

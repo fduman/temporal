@@ -2,6 +2,7 @@ package mongodb_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"testing"
@@ -9,6 +10,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
@@ -783,3 +787,87 @@ func (s *TaskStoreSuite) TestFairStoreRejectsPassZero() {
 	s.Require().ErrorAs(err, &internal)
 }
 
+// CreateTasks with UpdateMetadata and unchanged metadata must still take part
+// in the range_id fence: while another transaction holds a range_id change,
+// CreateTasks must not write its tasks. It fails with a condition failure if
+// that change commits before CreateTasks gives up retrying the write
+// conflict, and with ResourceExhausted otherwise.
+func (s *TaskStoreSuite) TestCreateTasksUpdateMetadataFencesRange() {
+	const (
+		ns    = "ns-tasks-fence-metadata"
+		queue = "queue-tasks-fence-metadata"
+	)
+	info := persistence.NewDataBlob([]byte("queue-info"), enumspb.ENCODING_TYPE_PROTO3.String())
+	s.Require().NoError(s.store.CreateTaskQueue(s.ctx, &persistence.InternalCreateTaskQueueRequest{
+		NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, RangeID: 7, TaskQueueInfo: info,
+	}))
+	createTask := func(id int64) error {
+		_, err := s.store.CreateTasks(s.ctx, &persistence.InternalCreateTasksRequest{
+			NamespaceID: ns, TaskQueue: queue, TaskType: enumspb.TASK_QUEUE_TYPE_WORKFLOW, RangeID: 7,
+			UpdateMetadata: true, TaskQueueInfo: info,
+			Tasks: []*persistence.InternalCreateTask{{
+				TaskId: id, Task: persistence.NewDataBlob([]byte("task"), enumspb.ENCODING_TYPE_PROTO3.String()), Subqueue: persistence.SubqueueZero,
+			}},
+		})
+		return err
+	}
+
+	db := rawTestDatabase(s.T(), s.dbName)
+	queues := db.Collection("task_queues")
+	queueID := fmt.Sprintf("%s|%s|%d|%d|v1", ns, queue, enumspb.TASK_QUEUE_TYPE_WORKFLOW, persistence.SubqueueZero)
+	fence := func() int64 {
+		var doc struct {
+			RangeFence int64 `bson:"range_fence"`
+		}
+		s.Require().NoError(queues.FindOne(s.ctx, bson.M{"_id": queueID}).Decode(&doc))
+		return doc.RangeFence
+	}
+
+	// The fence write changes the document even when the metadata does not.
+	before := fence()
+	s.Require().NoError(createTask(1))
+	s.Require().Greater(fence(), before)
+
+	// A range_id change held open in another transaction, committed while
+	// CreateTasks waits on it.
+	sess, err := db.Client().StartSession()
+	s.Require().NoError(err)
+	defer sess.EndSession(context.Background())
+	s.Require().NoError(sess.StartTransaction())
+	_, err = queues.UpdateOne(mongo.NewSessionContext(s.ctx, sess), bson.M{"_id": queueID}, bson.M{"$set": bson.M{"range_id": int64(8)}})
+	s.Require().NoError(err)
+	committed := make(chan error, 1)
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		committed <- sess.CommitTransaction(context.Background())
+	}()
+
+	err = createTask(2)
+	s.Require().NoError(<-committed)
+	var cfe *persistence.ConditionFailedError
+	var exhausted *serviceerror.ResourceExhausted
+	s.Require().True(errors.As(err, &cfe) || errors.As(err, &exhausted), "unexpected error: %v", err)
+
+	n, err := db.Collection("tasks").CountDocuments(s.ctx, bson.M{"namespace_id": ns, "task_queue": queue})
+	s.Require().NoError(err)
+	s.Require().Equal(int64(1), n)
+}
+
+// rawTestDatabase connects to the test database with the driver directly, to
+// set up states the store API cannot produce.
+func rawTestDatabase(t *testing.T, dbName string) *mongo.Database {
+	cfg := newMongoTestConfig(dbName)
+	opts := options.Client().SetHosts(cfg.Hosts)
+	if cfg.ReplicaSet != "" {
+		opts.SetReplicaSet(cfg.ReplicaSet)
+	}
+	if cfg.User != "" {
+		opts.SetAuth(options.Credential{Username: cfg.User, Password: cfg.Password, AuthSource: cfg.AuthSource})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := mongo.Connect(ctx, opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Disconnect(context.Background()) })
+	return c.Database(dbName)
+}
