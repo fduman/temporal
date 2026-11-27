@@ -1042,7 +1042,7 @@ func (s *visibilityStore) convertQueryParams(
 	// ORDER BY is not supported, as in the SQL store. Listing pages by
 	// visibility_time, so another order would break the page token.
 	if params != nil && len(params.OrderBy) > 0 {
-		return nil, query.NewConverterError("%s: 'ORDER BY' clause", query.NotSupportedErrMessage).ToInvalidArgument()
+		return nil, serviceerror.NewInvalidArgumentf("%s: 'ORDER BY' clause", query.NotSupportedErrMessage)
 	}
 	return params, nil
 }
