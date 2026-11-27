@@ -89,13 +89,6 @@ type (
 		CassandraBlob *dataBlobDoc `bson:"cassandra_blob,omitempty"`
 	}
 
-	historyTaskDoc struct {
-		CategoryID int          `bson:"category_id"`
-		FireTime   time.Time    `bson:"fire_time"`
-		TaskID     int64        `bson:"task_id"`
-		Blob       *dataBlobDoc `bson:"blob,omitempty"`
-	}
-
 	historyBranchDocument struct {
 		ID       string       `bson:"_id"`
 		ShardID  int32        `bson:"shard_id"`
@@ -171,7 +164,6 @@ type (
 		SignalRequestedIDs   []string         `bson:"signal_requested_ids,omitempty"`
 		ChasmNodes           []chasmNodeDoc   `bson:"chasm_nodes,omitempty"`
 		BufferedEvents       bufferedBatches  `bson:"buffered_events,omitempty"`
-		Tasks                []historyTaskDoc `bson:"tasks,omitempty"`
 		Checksum             *dataBlobDoc     `bson:"checksum,omitempty"`
 	}
 
@@ -465,34 +457,6 @@ func mapSignalRequestedIDs(ids map[string]struct{}) []string {
 	}
 	sort.Strings(result)
 	return result
-}
-
-func mapHistoryTasks(tasksByCategory map[taskspkg.Category][]persistence.InternalHistoryTask) []historyTaskDoc {
-	if len(tasksByCategory) == 0 {
-		return nil
-	}
-	docs := make([]historyTaskDoc, 0)
-	for category, taskList := range tasksByCategory {
-		categoryID := category.ID()
-		for _, task := range taskList {
-			docs = append(docs, historyTaskDoc{
-				CategoryID: categoryID,
-				FireTime:   task.Key.FireTime.UTC(),
-				TaskID:     task.Key.TaskID,
-				Blob:       dataBlobToDoc(task.Blob),
-			})
-		}
-	}
-	sort.Slice(docs, func(i, j int) bool {
-		if docs[i].CategoryID != docs[j].CategoryID {
-			return docs[i].CategoryID < docs[j].CategoryID
-		}
-		if docs[i].FireTime.Equal(docs[j].FireTime) {
-			return docs[i].TaskID < docs[j].TaskID
-		}
-		return docs[i].FireTime.Before(docs[j].FireTime)
-	})
-	return docs
 }
 
 func dataBlobDocToBlob(doc *dataBlobDoc) *commonpb.DataBlob {
@@ -1041,7 +1005,6 @@ func executionDocumentUpdateSet(doc *executionDocument) bson.M {
 		"signal_requested_ids":   doc.SignalRequestedIDs,
 		"chasm_nodes":            doc.ChasmNodes,
 		"buffered_events":        doc.BufferedEvents,
-		"tasks":                  doc.Tasks,
 		"checksum":               doc.Checksum,
 		"state_transition_count": doc.StateTransitionCount,
 	}
@@ -1211,11 +1174,6 @@ func (s *executionStore) applyMutationToExecutionDocument(
 	}
 	if newBatch := dataBlobToDoc(mutation.NewBufferedEvents); newBatch != nil {
 		doc.BufferedEvents = appendBufferedBatch(doc.BufferedEvents, *newBatch)
-	}
-
-	// Tasks (best effort only tracked for observability in this stub).
-	if len(mutation.Tasks) > 0 {
-		doc.Tasks = mapHistoryTasks(mutation.Tasks)
 	}
 
 	doc.Checksum = dataBlobToDoc(mutation.Checksum)
@@ -1393,6 +1351,9 @@ func (s *executionStore) applyWorkflowMutation(
 	updateSet := executionDocumentUpdateSet(doc)
 	result, err := s.executionsCol.UpdateOne(ctx, filter, bson.M{"$set": updateSet})
 	if err != nil {
+		if isSizeLimitError(err) {
+			return nil, newSizeLimitError(err)
+		}
 		return nil, serviceerror.NewUnavailablef("failed to update execution document: %v", err)
 	}
 	if result.MatchedCount == 0 {
@@ -1557,7 +1518,6 @@ func (s *executionStore) buildExecutionDocument(request *persistence.InternalCre
 		SignalInfos:         mapInt64Blobs(snapshot.SignalInfos),
 		SignalRequestedIDs:  mapSignalRequestedIDs(snapshot.SignalRequestedIDs),
 		ChasmNodes:          mapChasmNodes(snapshot.ChasmNodes),
-		Tasks:               mapHistoryTasks(snapshot.Tasks),
 		Checksum:            dataBlobToDoc(snapshot.Checksum),
 	}
 
@@ -1786,6 +1746,9 @@ func (s *executionStore) insertExecutionDocument(ctx context.Context, doc *execu
 	if err != nil {
 		if mongo.IsDuplicateKeyError(err) {
 			return &persistence.WorkflowConditionFailedError{Msg: "workflow execution already exists"}
+		}
+		if isSizeLimitError(err) {
+			return newSizeLimitError(err)
 		}
 		return serviceerror.NewUnavailablef("failed to insert execution document: %v", err)
 	}
@@ -2348,6 +2311,9 @@ func (s *executionStore) SetWorkflowExecution(
 		update := bson.M{"$set": executionDocumentUpdateSet(newDoc)}
 		result, err := s.executionsCol.UpdateOne(sessCtx, filter, update)
 		if err != nil {
+			if isSizeLimitError(err) {
+				return nil, newSizeLimitError(err)
+			}
 			return nil, serviceerror.NewUnavailablef("failed to set workflow execution: %v", err)
 		}
 		if result.MatchedCount == 0 {
@@ -2915,45 +2881,86 @@ func (s *executionStore) AppendHistoryNodes(
 		Events:    dataBlobToDoc(node.Events),
 	}
 
-	if _, err := s.historyNodesCol.InsertOne(ctx, nodeDoc); err != nil {
-		switch {
-		case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-			return &persistence.AppendHistoryTimeoutError{Msg: err.Error()}
-		case mongo.IsDuplicateKeyError(err):
-			return &persistence.ConditionFailedError{Msg: "history node already exists"}
-		default:
-			return serviceerror.NewUnavailablef("failed to append history node: %v", err)
-		}
+	// The node is upserted, as the SQL stores do (INSERT ... ON DUPLICATE KEY
+	// UPDATE): history retries an append whose outcome it does not know, and the
+	// retry must succeed rather than fail with a condition error.
+	nodeSet := bson.M{
+		"shard_id":    nodeDoc.ShardID,
+		"tree_id":     nodeDoc.TreeID,
+		"branch_id":   nodeDoc.BranchID,
+		"node_id":     nodeDoc.NodeID,
+		"txn_id":      nodeDoc.TxnID,
+		"prev_txn_id": nodeDoc.PrevTxnID,
+		"events":      nodeDoc.Events,
+	}
+	branchDoc := historyBranchDocument{
+		ID:       historyBranchDocID(treeID, branchID),
+		ShardID:  request.ShardID,
+		TreeID:   treeID,
+		BranchID: branchID,
+		Info:     request.Info,
+		TreeInfo: dataBlobToDoc(request.TreeInfo),
+	}
+	branchUpdate := bson.M{
+		"$set": bson.M{
+			"shard_id":  branchDoc.ShardID,
+			"tree_id":   branchDoc.TreeID,
+			"branch_id": branchDoc.BranchID,
+			"info":      branchDoc.Info,
+			"tree_info": branchDoc.TreeInfo,
+		},
 	}
 
-	if request.IsNewBranch {
-		branchDoc := historyBranchDocument{
-			ID:       historyBranchDocID(treeID, branchID),
-			ShardID:  request.ShardID,
-			TreeID:   treeID,
-			BranchID: branchID,
-			Info:     request.Info,
-			TreeInfo: dataBlobToDoc(request.TreeInfo),
+	write := func(ctx context.Context) error {
+		if _, err := s.historyNodesCol.UpdateOne(ctx, bson.M{"_id": nodeDoc.ID}, bson.M{"$set": nodeSet}, options.Update().SetUpsert(true)); err != nil {
+			return err
 		}
-		update := bson.M{
-			"$set": bson.M{
-				"shard_id":  branchDoc.ShardID,
-				"tree_id":   branchDoc.TreeID,
-				"branch_id": branchDoc.BranchID,
-				"info":      branchDoc.Info,
-				"tree_info": branchDoc.TreeInfo,
-			},
-		}
-		opts := options.Update().SetUpsert(true)
-		if _, err := s.historyBranchesCol.UpdateOne(ctx, bson.M{"_id": branchDoc.ID}, update, opts); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				return &persistence.AppendHistoryTimeoutError{Msg: err.Error()}
+		if request.IsNewBranch {
+			if _, err := s.historyBranchesCol.UpdateOne(ctx, bson.M{"_id": branchDoc.ID}, branchUpdate, options.Update().SetUpsert(true)); err != nil {
+				return err
 			}
-			return serviceerror.NewUnavailablef("failed to upsert history branch: %v", err)
 		}
+		return nil
 	}
 
+	// Workflow creation and updates append their events inside their own
+	// transaction. The writes then belong to that transaction, and its errors,
+	// write conflicts included, are left for it to handle.
+	if mongo.SessionFromContext(ctx) != nil {
+		return write(ctx)
+	}
+
+	var err error
+	if request.IsNewBranch {
+		// A new branch writes its first node and its branch record together,
+		// as SQL does in one transaction: a branch must not exist without its
+		// node, nor a node without its branch.
+		_, err = s.executeTransaction(ctx, func(sessCtx context.Context) (interface{}, error) {
+			return nil, write(sessCtx)
+		})
+	} else {
+		err = write(ctx)
+	}
+	if err != nil {
+		return appendHistoryNodesError(err)
+	}
 	return nil
+}
+
+// appendHistoryNodesError maps a failed append the way the SQL stores do: a
+// deadline or cancellation is an AppendHistoryTimeoutError, whose outcome is
+// unknown, and other driver errors are Unavailable.
+func appendHistoryNodesError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return &persistence.AppendHistoryTimeoutError{Msg: err.Error()}
+	}
+	if isSizeLimitError(err) {
+		return newSizeLimitError(err)
+	}
+	if isServiceError(err) {
+		return err
+	}
+	return serviceerror.NewUnavailablef("failed to append history node: %v", err)
 }
 
 func (s *executionStore) DeleteHistoryNodes(
@@ -3123,12 +3130,12 @@ func (s *executionStore) DeleteHistoryBranch(
 		return serviceerror.NewInvalidArgument("DeleteHistoryBranch missing branch info")
 	}
 
+	// SQL deletes the branch and its nodes in one transaction. A branch can have
+	// far more nodes than a MongoDB transaction should hold, so the nodes go
+	// first and the branch record last: if the delete stops half way, the branch
+	// is still listed and the history scavenger or a retry deletes the rest.
+	// Deleting the branch first would leave nodes that nothing points to.
 	branchInfo := request.BranchInfo
-	filter := bson.M{"_id": historyBranchDocID(branchInfo.GetTreeId(), branchInfo.GetBranchId())}
-	if _, err := s.historyBranchesCol.DeleteOne(ctx, filter); err != nil {
-		return serviceerror.NewUnavailablef("failed to delete history branch: %v", err)
-	}
-
 	for _, br := range request.BranchRanges {
 		rangeFilter := bson.M{
 			"shard_id":  request.ShardID,
@@ -3143,6 +3150,10 @@ func (s *executionStore) DeleteHistoryBranch(
 		}
 	}
 
+	filter := bson.M{"_id": historyBranchDocID(branchInfo.GetTreeId(), branchInfo.GetBranchId())}
+	if _, err := s.historyBranchesCol.DeleteOne(ctx, filter); err != nil {
+		return serviceerror.NewUnavailablef("failed to delete history branch: %v", err)
+	}
 	return nil
 }
 
